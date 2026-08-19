@@ -1133,6 +1133,24 @@ static void mrp_emit_remote_command(
         m->remote_command_cb(command, m->remote_command_userdata);
 }
 
+static bool mrp_bplist_get_root_string(const uint8_t *body, int body_len,
+                                       const char *key, char *out,
+                                       size_t out_size)
+{
+    return body && body_len >= 8 &&
+           ap2_bplist_get_root_string(body, (size_t)body_len, key,
+                                      out, out_size);
+}
+
+static bool mrp_bplist_get_event_string(const uint8_t *body, int body_len,
+                                        const char *lower_key,
+                                        const char *upper_key, char *out,
+                                        size_t out_size)
+{
+    return mrp_bplist_get_root_string(body, body_len, upper_key, out, out_size) ||
+           mrp_bplist_get_root_string(body, body_len, lower_key, out, out_size);
+}
+
 static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
                                      ap2_remote_command_t *command)
 {
@@ -1142,11 +1160,11 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
 
     char type[64];
     char value[64];
-    if (!ap2_bplist_get_root_string(
-            body, (size_t)body_len, "type", type, sizeof(type)) ||
+    if (!mrp_bplist_get_event_string(body, body_len, "type", "Type", type,
+                                     sizeof(type)) ||
         strcmp(type, "sendMediaRemoteCommand") != 0 ||
-        !ap2_bplist_get_root_string(
-            body, (size_t)body_len, "value", value, sizeof(value)))
+        !mrp_bplist_get_event_string(body, body_len, "value", "Value", value,
+                                     sizeof(value)))
         return false;
 
     if (strcmp(value, "play") == 0)
@@ -1179,16 +1197,24 @@ static void mrp_log_event_command_body(const char *header,
         char value[256];
         char safe_type[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
         char safe_value[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
-        if (ap2_bplist_get_root_string(
-                body, (size_t)body_len, "type", type, sizeof(type)))
+        bool have_type = mrp_bplist_get_event_string(
+            body, body_len, "type", "Type", type, sizeof(type));
+        bool have_value = mrp_bplist_get_event_string(
+            body, body_len, "value", "Value", value, sizeof(value));
+        if (have_type)
             mrp_event_log_text(safe_type, type);
-        if (ap2_bplist_get_root_string(
-                body, (size_t)body_len, "value", value, sizeof(value)))
+        if (have_value)
             mrp_event_log_text(safe_value, value);
         if (safe_type[0] && safe_value[0]) {
             LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
                       "type=%s value=%s",
                       safe_content_type, body_len, safe_type, safe_value);
+            return;
+        }
+        if (safe_type[0]) {
+            LOG_DEBUG("[MRP] event bplist content_type=%s content_length=%d "
+                      "type=%s value=<structured>",
+                      safe_content_type, body_len, safe_type);
             return;
         }
     }

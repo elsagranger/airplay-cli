@@ -158,14 +158,14 @@ static int build_event_request(uint8_t *encrypted, size_t encrypted_size,
         key, counter, request, request_len, encrypted);
 }
 
-static int build_typed_command_request(
+static int build_cased_command_request(
     uint8_t *encrypted, size_t encrypted_size,
     const uint8_t key[KEY_SIZE], uint64_t counter, int cseq,
-    const char *type, const char *value)
+    const char *type, const char *value, bool apple_case)
 {
     ap2_pl_node *root = ap2_pl_dict();
-    ap2_pl_dict_set(root, "type", ap2_pl_string(type));
-    ap2_pl_dict_set(root, "value", ap2_pl_string(value));
+    ap2_pl_dict_set(root, apple_case ? "Type" : "type", ap2_pl_string(type));
+    ap2_pl_dict_set(root, apple_case ? "Value" : "value", ap2_pl_string(value));
     uint8_t *body = NULL;
     int body_len = ap2_pl_serialize(root, &body);
     ap2_pl_free(root);
@@ -174,6 +174,15 @@ static int build_typed_command_request(
         encrypted, encrypted_size, key, counter, cseq, body, body_len);
     free(body);
     return encrypted_len;
+}
+
+static int build_typed_command_request(
+    uint8_t *encrypted, size_t encrypted_size,
+    const uint8_t key[KEY_SIZE], uint64_t counter, int cseq,
+    const char *type, const char *value)
+{
+    return build_cased_command_request(
+        encrypted, encrypted_size, key, counter, cseq, type, value, false);
 }
 
 static int build_command_request(uint8_t *encrypted, size_t encrypted_size,
@@ -379,17 +388,24 @@ int main(void)
     ap2_mrp_tick(mrp);
     read_response(sockets[1], sender_key, 6, 48);
 
-    encrypted_len = build_embedded_nul_request(
-        encrypted, sizeof(encrypted), receiver_key, 7, 49);
+    encrypted_len = build_cased_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 7, 49,
+        "sendMediaRemoteCommand", "play", true);
     assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
     ap2_mrp_tick(mrp);
     read_response(sockets[1], sender_key, 7, 49);
 
-    encrypted_len = build_nested_command_request(
+    encrypted_len = build_embedded_nul_request(
         encrypted, sizeof(encrypted), receiver_key, 8, 50);
     assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
     ap2_mrp_tick(mrp);
     read_response(sockets[1], sender_key, 8, 50);
+
+    encrypted_len = build_nested_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 9, 51);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 9, 51);
 
     uint8_t corrupt_bplist[40] = {0};
     memcpy(corrupt_bplist, "bplist00", 8);
@@ -398,19 +414,19 @@ int main(void)
     corrupt_bplist[23] = 1;  /* object count */
     corrupt_bplist[39] = 8;  /* invalid offset-table location */
     encrypted_len = build_event_request(
-        encrypted, sizeof(encrypted), receiver_key, 9, 51,
+        encrypted, sizeof(encrypted), receiver_key, 10, 52,
         corrupt_bplist, (int)sizeof(corrupt_bplist));
     assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
     ap2_mrp_tick(mrp);
-    read_response(sockets[1], sender_key, 9, 51);
+    read_response(sockets[1], sender_key, 10, 52);
 
     static const uint8_t invalid_body[] = {'t', 'e', 's', 't'};
     encrypted_len = build_event_request(
-        encrypted, sizeof(encrypted), receiver_key, 10, 52,
+        encrypted, sizeof(encrypted), receiver_key, 11, 53,
         invalid_body, (int)sizeof(invalid_body));
     assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
     ap2_mrp_tick(mrp);
-    read_response(sockets[1], sender_key, 10, 52);
+    read_response(sockets[1], sender_key, 11, 53);
 
     static const ap2_remote_command_t expected_commands[] = {
         AP2_REMOTE_COMMAND_PLAY,
@@ -418,11 +434,12 @@ int main(void)
         AP2_REMOTE_COMMAND_PLAY_PAUSE,
         AP2_REMOTE_COMMAND_NEXT,
         AP2_REMOTE_COMMAND_PREVIOUS,
+        AP2_REMOTE_COMMAND_PLAY,
     };
     static const char *expected_names[] = {
-        "play", "pause", "play_pause", "next", "previous",
+        "play", "pause", "play_pause", "next", "previous", "play",
     };
-    assert(capture.count == 5);
+    assert(capture.count == 6);
     for (int i = 0; i < capture.count; i++) {
         assert(capture.commands[i] == expected_commands[i]);
         assert(strcmp(
@@ -445,6 +462,7 @@ int main(void)
     assert(strstr(logs, "type=sendMediaRemoteCommand value=plps"));
     assert(strstr(logs, "type=sendMediaRemoteCommand value=nitm"));
     assert(strstr(logs, "type=sendMediaRemoteCommand value=pitm"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=play"));
     assert(strstr(logs, "body parse failed"));
     assert(strstr(logs, "content_length=4 hex=74657374"));
 
