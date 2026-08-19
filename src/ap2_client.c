@@ -205,6 +205,8 @@ struct ap2cl_s {
     char *active_remote;
     char *iface;
     char *publish_ip;         /* address we advertise to the device (multi-homed) */
+    char **group_peers;       /* other receiver addresses in this playback group */
+    size_t group_peer_count;
     struct in_addr bind_addr; /* resolved local bind address (INADDR_ANY if none) */
     char *secret;
     char *password;
@@ -2257,12 +2259,35 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                  p->device.address, ntohs(p->data_addr.sin_port));
     }
 
-    /* 6. SETPEERS (PTP only): a bare binary-plist array of IP strings
-     * [receiver, us] so the receiver knows the timing group members. */
+    /* 6. SETPEERS (PTP only): a bare binary-plist array of IP strings. Apple
+     * senders put every receiver in the playback group in this list, followed
+     * by the sender address. The target is always included even when the
+     * caller did not provide an explicit group peer list. */
     if (p->use_ptp) {
+#define AP2_MAX_SETPEERS 66
+        const char *peers[AP2_MAX_SETPEERS];
+        int peer_count = 0;
+#define AP2_ADD_SETPEER(value) do { \
+            const char *peer_value = (value); \
+            bool duplicate = false; \
+            if (peer_value && *peer_value) { \
+                for (int peer_i = 0; peer_i < peer_count; peer_i++) \
+                    if (strcmp(peers[peer_i], peer_value) == 0) { \
+                        duplicate = true; \
+                        break; \
+                    } \
+                if (!duplicate && peer_count < AP2_MAX_SETPEERS) \
+                    peers[peer_count++] = peer_value; \
+            } \
+        } while (0)
+        for (size_t i = 0; i < p->group_peer_count; i++)
+            AP2_ADD_SETPEER(p->group_peers[i]);
+        AP2_ADD_SETPEER(p->device.address);
+        AP2_ADD_SETPEER(our_addr);
+
         ap2_pl_node *arr = ap2_pl_array();
-        ap2_pl_array_append(arr, ap2_pl_string(p->device.address));
-        ap2_pl_array_append(arr, ap2_pl_string(our_addr));
+        for (int i = 0; i < peer_count; i++)
+            ap2_pl_array_append(arr, ap2_pl_string(peers[i]));
         uint8_t *sp_data = NULL;
         int sp_len = ap2_pl_serialize(arr, &sp_data);
         ap2_pl_free(arr);
@@ -2272,15 +2297,16 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                                        "application/x-apple-binary-plist", &resp, &resp_len);
         free(sp_data);
         free(resp);
-        LOG_INFO("[AP2] SETPEERS [%s, %s] -> %d", p->device.address, our_addr, sp_status);
+        LOG_INFO("[AP2] SETPEERS group peers=%d -> %d", peer_count, sp_status);
         if (sp_status <= 0) return false;
 
-        const char *peers[2] = { p->device.address, our_addr };
-        ap2_ptp_set_peers(p->ptp, peers, 2);
+        ap2_ptp_set_peers(p->ptp, peers, peer_count);
         /* Kick timing at the fresh peer so it measures our clock right away
          * (no-op without a shared daemon; the in-process engine kicks itself
          * from ap2_ptp_set_peers). */
         ap2_ptp_shared_kick(p->ptp);
+#undef AP2_ADD_SETPEER
+#undef AP2_MAX_SETPEERS
     }
 
     /* 6b. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
@@ -3131,6 +3157,8 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
     if (p->events_sock >= 0) close(p->events_sock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
+    for (size_t i = 0; i < p->group_peer_count; i++) free(p->group_peers[i]);
+    free(p->group_peers);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
     free(p);
@@ -3163,6 +3191,26 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
     if (!p || !ip) return;
     free(p->publish_ip);
     p->publish_ip = strdup(ip);
+}
+
+void ap2cl_set_group_peers(struct ap2cl_s *p, const char *const *peers,
+                           size_t count)
+{
+    if (!p) return;
+    for (size_t i = 0; i < p->group_peer_count; i++) free(p->group_peers[i]);
+    free(p->group_peers);
+    p->group_peers = NULL;
+    p->group_peer_count = 0;
+    if (!peers || count == 0) return;
+
+    p->group_peers = calloc(count, sizeof(*p->group_peers));
+    if (!p->group_peers) return;
+    for (size_t i = 0; i < count; i++) {
+        if (!peers[i] || !*peers[i]) continue;
+        p->group_peers[p->group_peer_count] = strdup(peers[i]);
+        if (p->group_peers[p->group_peer_count]) p->group_peer_count++;
+    }
+    LOG_INFO("[AP2] Group peer addresses configured: %zu", p->group_peer_count);
 }
 
 /* Effective splice queue depth: the compiled default unless the caller

@@ -15,6 +15,7 @@
 #define __AP2_CLIENT_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <netinet/in.h>
 
@@ -502,6 +503,13 @@ void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */
 void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
+
+/* Set the ordered receiver addresses in this playback group. The target device
+ * is added when missing and the sender address is appended. When unset, the
+ * native PTP session keeps the traditional two-entry SETPEERS list. Must be
+ * called before ap2cl_connect(). */
+void ap2cl_set_group_peers(struct ap2cl_s *p, const char *const *peers,
+                           size_t count);
 
 /* Return the requested format and the /info-advertised format capabilities
  * (populated by the native flow's GET /info; zeroed otherwise). */
