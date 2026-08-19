@@ -45,7 +45,7 @@
 #include <openssl/bn.h>
 #include <openssl/sha.h>
 
-#include "../libraop/crosstools/src/platform.h"
+#include "platform.h"
 #include "cross_log.h"
 #include "ap2_hap.h"
 #include "ap2_io.h"

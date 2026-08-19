@@ -41,9 +41,9 @@
 #include <openssl/rand.h>
 #include <openssl/evp.h>
 
-#include "../libraop/crosstools/src/platform.h"
-#include "../libraop/crosstools/src/cross_net.h"
-#include "../libraop/src/raop_client.h"
+#include "platform.h"
+#include "cross_net.h"
+#include "raop_client.h"
 #include "alac_wrapper.h"
 #include "cross_util.h"
 #include "cross_log.h"
@@ -942,6 +942,24 @@ static int ap2_rtsp_send_tracked(
     return ap2_rtsp_send_ex_tracked(
         p, method, uri, body, body_len, ct, NULL,
         resp_body, resp_len, request_started);
+}
+
+static const char *ap2_setpeers_uri(const struct ap2cl_s *p)
+{
+    /* Native groups use the receiver-wide notification endpoint used by
+     * Apple-compatible senders. Keep the established session URL for solo
+     * playback, where no explicit receiver group was supplied. */
+    return p->group_peer_count > 1 ? "/peer-list-changed" : p->session_url;
+}
+
+static bool ap2_set_dscp_ef(int fd, const char *label)
+{
+    const int tos = 0xB8; /* DSCP EF (46) in the upper six TOS bits. */
+    if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) == 0)
+        return true;
+    LOG_WARN("[AP2] Cannot mark %s socket DSCP EF: %s", label,
+             strerror(errno));
+    return false;
 }
 
 /* Keep a sent packet available for retransmission. Called on the audio thread
@@ -2040,6 +2058,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     p->data_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (p->data_sock < 0 || !ap2_set_nonblocking(p->data_sock, "RTP data"))
         return false;
+    ap2_set_dscp_ef(p->data_sock, "RTP data");
     struct sockaddr_in bind_addr = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
     if (bind(p->data_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
         LOG_ERROR("[AP2] Cannot bind RTP data socket: %s", strerror(errno));
@@ -2053,6 +2072,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     p->ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (p->ctrl_sock < 0 || !ap2_set_nonblocking(p->ctrl_sock, "RTP control"))
         return false;
+    ap2_set_dscp_ef(p->ctrl_sock, "RTP control");
     if (bind(p->ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
         LOG_ERROR("[AP2] Cannot bind RTP control socket: %s", strerror(errno));
         return false;
@@ -2293,11 +2313,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_free(arr);
 
         resp = NULL; resp_len = 0;
-        int sp_status = ap2_rtsp_send(p, "SETPEERS", p->session_url, sp_data, sp_len,
+        const char *setpeers_uri = ap2_setpeers_uri(p);
+        int sp_status = ap2_rtsp_send(p, "SETPEERS", setpeers_uri, sp_data, sp_len,
                                        "application/x-apple-binary-plist", &resp, &resp_len);
         free(sp_data);
         free(resp);
-        LOG_INFO("[AP2] SETPEERS group peers=%d -> %d", peer_count, sp_status);
+        LOG_INFO("[AP2] SETPEERS uri=%s group peers=%d -> %d",
+                 setpeers_uri, peer_count, sp_status);
         if (sp_status <= 0) return false;
 
         ap2_ptp_set_peers(p->ptp, peers, peer_count);
@@ -5457,6 +5479,16 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+const char *ap2cl_test_setpeers_uri(struct ap2cl_s *p)
+{
+    return ap2_setpeers_uri(p);
+}
+
+bool ap2cl_test_set_dscp_ef(int fd)
+{
+    return ap2_set_dscp_ef(fd, "test");
+}
+
 /* Hand the client a ready MRP context without a paired session, so a test can
  * drive the /command now-playing path against a scripted RTSP peer. The
  * client takes ownership (ap2cl_destroy frees it). */

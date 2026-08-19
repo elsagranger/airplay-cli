@@ -16,7 +16,7 @@
  * so include it explicitly before pulling in bplist.h. */
 /* Access private members of bplist for integer reading */
 #define private public
-#include "../libraop/src/bplist.h"
+#include "bplist.h"
 #undef private
 
 #include "ap2_bplist.h"

@@ -64,6 +64,8 @@ void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
 void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames);
 uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p);
 ap2_connect_error_t ap2cl_test_auth_error_kind(struct ap2cl_s *p);
+const char *ap2cl_test_setpeers_uri(struct ap2cl_s *p);
+bool ap2cl_test_set_dscp_ef(int fd);
 
 typedef struct {
     int fd;
@@ -165,6 +167,48 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(close(sockets[0]) == 0);
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
+}
+
+static void test_native_group_setpeers_uri(void)
+{
+    ap2_device_info_t device = {
+        .name = "SETPEERS test",
+        .address = "192.168.1.50",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_test_attach_rtsp_socket(client, -1);
+    assert(strcmp(ap2cl_test_setpeers_uri(client),
+                  "rtsp://test/session") == 0);
+
+    const char *peers[] = {"192.168.1.50", "192.168.1.51"};
+    ap2cl_set_group_peers(client, peers, 2);
+    assert(strcmp(ap2cl_test_setpeers_uri(client),
+                  "/peer-list-changed") == 0);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client SETPEERS URI selection test passed");
+}
+
+static void test_native_realtime_dscp_ef(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(fd >= 0);
+    assert(ap2cl_test_set_dscp_ef(fd));
+    int tos = 0;
+    socklen_t tos_len = sizeof(tos);
+    assert(getsockopt(fd, IPPROTO_IP, IP_TOS, &tos, &tos_len) == 0);
+    assert((tos & 0xFC) == 0xB8);
+    assert(close(fd) == 0);
+    puts("ap2_client realtime DSCP EF test passed");
 }
 
 static void test_native_flush_rejects_receiver_error(void)
@@ -2279,6 +2323,8 @@ int main(void)
     test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
+    test_native_group_setpeers_uri();
+    test_native_realtime_dscp_ef();
     test_env_toggle_parsing();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();

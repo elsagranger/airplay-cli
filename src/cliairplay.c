@@ -28,11 +28,11 @@
 #include <errno.h>
 #include <stdatomic.h>
 
-#include "../libraop/crosstools/src/platform.h"
-#include "../libraop/crosstools/src/cross_thread.h"
-#include "../libraop/crosstools/src/cross_net.h"
-#include "../libraop/crosstools/src/cross_ssl.h"
-#include "../libraop/src/raop_client.h"
+#include "platform.h"
+#include "cross_thread.h"
+#include "cross_net.h"
+#include "cross_ssl.h"
+#include "raop_client.h"
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_client.h"
