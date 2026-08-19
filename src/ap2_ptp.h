@@ -187,6 +187,9 @@ void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip);
 void ap2_ptp_shared_register_group(struct ap2_ptp_ctx *ctx,
                                    const char *const *ips, size_t count);
 
+/* Release a registered receiver group immediately. Safe to call repeatedly. */
+void ap2_ptp_shared_unregister_group(struct ap2_ptp_ctx *ctx);
+
 /*
  * Ask the daemon to send timing to the current peer set immediately, instead
  * of waiting out the announce/sync intervals. Called right after SETPEERS so

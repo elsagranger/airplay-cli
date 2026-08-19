@@ -1480,14 +1480,18 @@ static void ap2_parse_format_capability(const uint8_t *data, size_t len,
         *known = true;
 }
 
-/* Build one timing-peer dict {ID, DeviceType, ClockID, SupportsClockPort..., Addresses:[addr]}. */
-static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, const char *addr)
+/* Build one timing-peer dict for a session SETUP. */
+static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id,
+                                         const char *addr, bool native_group)
 {
     ap2_pl_node *d = ap2_pl_dict();
     ap2_pl_dict_set(d, "ID", ap2_pl_string(id));
-    ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
-    ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
-    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+    if (!native_group) {
+        ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
+        ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
+    }
+    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride",
+                    ap2_pl_bool(native_group));
     ap2_pl_node *addrs = ap2_pl_array();
     ap2_pl_array_append(addrs, ap2_pl_string(addr));
     ap2_pl_dict_set(d, "Addresses", addrs);
@@ -1971,14 +1975,26 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
         ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
         ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
-        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
-        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
-        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
-        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        bool native_group = p->group_peer_count > 1;
+        if (native_group) {
+            /* Match the proven airplay2-rs group SETUP. Group membership is
+             * expressed by SETPEERS; per-connection random group UUIDs describe
+             * two unrelated groups and make HomePods accept both streams without
+             * lighting the secondary as part of the stereo session. */
+            ap2_pl_dict_set(root, "timingPort", ap2_pl_int(319));
+        } else {
+            ap2_pl_dict_set(root, "name", ap2_pl_string(name));
+            ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
+            ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
+            ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        }
         ap2_pl_dict_set(root, "timingPeerInfo",
-                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+                        ap2_make_timing_peer(peer_id, timeline_id, our_addr,
+                                             native_group));
         ap2_pl_node *peer_list = ap2_pl_array();
-        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+        ap2_pl_array_append(peer_list,
+                            ap2_make_timing_peer(peer_id, timeline_id, our_addr,
+                                                 native_group));
         ap2_pl_dict_set(root, "timingPeerList", peer_list);
 
         plist_len = ap2_pl_serialize(root, &plist_data);
@@ -4659,6 +4675,7 @@ void ap2cl_stop(struct ap2cl_s *p)
 {
     if (!p) return;
     ap2_clock_verify_disarm(p);
+    if (p->ptp) ap2_ptp_shared_unregister_group(p->ptp);
     p->content_paused = false;
     p->content_stopped = false;
     ap2_content_skip_reset(p, "stop");

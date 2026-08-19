@@ -1144,17 +1144,9 @@ void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
     if (!ctx) return;
     ap2_ptp_stop(ctx);
     if (ctx->shm_active) {
-        if (ctx->shared_group_registered) {
-            char cmd[512] = "V";
-            size_t used = 1;
-            for (int i = 0; i < ctx->shared_group_count; i++) {
-                int written = snprintf(cmd + used, sizeof(cmd) - used, " %s",
-                                       ctx->shared_group_ips[i]);
-                if (written < 0 || (size_t)written >= sizeof(cmd) - used) break;
-                used += (size_t)written;
-            }
-            ap2_ptp_ctrl_send(cmd, 100, NULL, 0);
-        } else if (ctx->shared_ip) {
+        if (ctx->shared_group_registered)
+            ap2_ptp_shared_unregister_group(ctx);
+        else if (ctx->shared_ip) {
             ap2_ptp_shared_unregister(ctx, ctx->shared_ip);
         }
         ap2_ptp_shm_reader_close(&ctx->shm_reader);
@@ -1612,6 +1604,25 @@ void ap2_ptp_shared_register_group(struct ap2_ptp_ctx *ctx,
     ctx->shared_group_registered = ok;
     LOG_INFO("[PTP] Registered receiver group (leader=%s, peers=%d) with daemon -> %s",
              ctx->shared_group_ips[0], ctx->shared_group_count,
+             ok ? ack : "(no ack)");
+}
+
+void ap2_ptp_shared_unregister_group(struct ap2_ptp_ctx *ctx)
+{
+    if (!ctx || !ctx->shm_active || !ctx->shared_group_registered) return;
+
+    char cmd[512] = "V";
+    size_t used = 1;
+    for (int i = 0; i < ctx->shared_group_count; i++) {
+        int written = snprintf(cmd + used, sizeof(cmd) - used, " %s",
+                               ctx->shared_group_ips[i]);
+        if (written < 0 || (size_t)written >= sizeof(cmd) - used) break;
+        used += (size_t)written;
+    }
+    char ack[128] = {0};
+    bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
+    if (ok) ctx->shared_group_registered = false;
+    LOG_INFO("[PTP] Unregistered receiver group from daemon -> %s",
              ok ? ack : "(no ack)");
 }
 
