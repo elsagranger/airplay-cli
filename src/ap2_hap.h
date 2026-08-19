@@ -9,6 +9,7 @@
 #define __AP2_HAP_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -130,5 +131,6 @@ void ap2_hap_restore_read_counter(struct ap2_hap_ctx *ctx, uint64_t counter);
 
 /* Get the X25519 shared secret (32 bytes) - used as audio encryption key. */
 const uint8_t *ap2_hap_get_shared_secret(struct ap2_hap_ctx *ctx);
+size_t ap2_hap_get_shared_secret_len(struct ap2_hap_ctx *ctx);
 
 #endif /* __AP2_HAP_H_ */

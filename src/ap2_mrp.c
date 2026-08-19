@@ -161,7 +161,8 @@ struct ap2_mrp_ctx {
 
     /* Channel crypto. The DataStream keys derive from the pairing shared
      * secret of the RTSP session that performed the type-130 SETUP. */
-    uint8_t shared_secret[MRP_KEY_SIZE];
+    uint8_t shared_secret[64];
+    size_t shared_secret_len;
     bool have_secret;
     uint8_t out_key[MRP_KEY_SIZE];    /* DataStream-Output-Encryption-Key */
     uint8_t in_key[MRP_KEY_SIZE];     /* DataStream-Input-Encryption-Key */
@@ -1382,7 +1383,8 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *device_name,
                                     const char *session_uuid,
                                     const char *group_uuid,
-                                    const uint8_t *reuse_shared_secret)
+                                    const uint8_t *reuse_shared_secret,
+                                    size_t reuse_shared_secret_len)
 {
     if (!host) return NULL;
     struct ap2_mrp_ctx *m = calloc(1, sizeof(*m));
@@ -1405,8 +1407,11 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     pthread_mutex_init(&m->send_lock, NULL);
     atomic_init(&m->event_connected, false);
 
-    if (reuse_shared_secret) {
-        memcpy(m->shared_secret, reuse_shared_secret, MRP_KEY_SIZE);
+    if (reuse_shared_secret &&
+        (reuse_shared_secret_len == MRP_KEY_SIZE ||
+         reuse_shared_secret_len == sizeof(m->shared_secret))) {
+        memcpy(m->shared_secret, reuse_shared_secret, reuse_shared_secret_len);
+        m->shared_secret_len = reuse_shared_secret_len;
         m->have_secret = true;
     }
 
@@ -1453,10 +1458,10 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
     }
     /* The receiver is the logical writer on this reverse channel, so the key
      * labels are swapped from our perspective (pyatv EventChannel). */
-    if (!mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, MRP_EVENTS_SALT,
+    if (!mrp_hkdf_sha512(m->shared_secret, m->shared_secret_len, MRP_EVENTS_SALT,
                          MRP_EVENTS_READ_INFO,
                          m->event_out_key, MRP_KEY_SIZE) ||
-        !mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, MRP_EVENTS_SALT,
+        !mrp_hkdf_sha512(m->shared_secret, m->shared_secret_len, MRP_EVENTS_SALT,
                          MRP_EVENTS_WRITE_INFO,
                          m->event_in_key, MRP_KEY_SIZE)) {
         LOG_ERROR("[MRP] event channel key derivation failed");
@@ -1486,9 +1491,9 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     char salt[64];
     snprintf(salt, sizeof(salt), MRP_DATASTREAM_SALT_PREFIX "%llu",
              (unsigned long long)seed);
-    if (!mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, salt,
+    if (!mrp_hkdf_sha512(m->shared_secret, m->shared_secret_len, salt,
                          MRP_DATASTREAM_OUTPUT_INFO, m->out_key, MRP_KEY_SIZE) ||
-        !mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, salt,
+        !mrp_hkdf_sha512(m->shared_secret, m->shared_secret_len, salt,
                          MRP_DATASTREAM_INPUT_INFO, m->in_key, MRP_KEY_SIZE)) {
         LOG_ERROR("[MRP] DataStream key derivation failed");
         return false;

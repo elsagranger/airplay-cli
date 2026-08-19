@@ -247,10 +247,12 @@ struct ap2cl_s {
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
-     * state carrier + body builder; only on pair-verified native sessions.
+     * state carrier + body builder; on pair-verified native sessions and
+     * transient-paired Apple receivers.
      * mrp_lock protects mutable state/snapshots only. mrp_publish_lock orders
      * mutations with network publication without affecting health reads. */
     struct ap2_mrp_ctx *mrp;
+    struct ap2cl_s *mrp_sidecar;   /* independent remote-control RTSP session */
     pthread_mutex_t mrp_lock;
     pthread_mutex_t mrp_publish_lock;
     atomic_int mrp_event_health;
@@ -455,6 +457,14 @@ static bool ap2_env_enabled(const char *name, bool unset_default)
 static bool ap2_mrp_type130_enabled(void)
 {
     return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
+}
+
+/* Some HomePod software accepts type-130 state but only exposes the session
+ * to Home/Control Center after legacy MediaRemote registration arrives on
+ * /command. Keep this opt-in for receivers that accept both transports. */
+static bool ap2_mrp_type130_dual_enabled(void)
+{
+    return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130_DUAL", false);
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -1498,16 +1508,16 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id,
     return d;
 }
 
-/* Issue the type-130 remote-control (MRP) data-channel stream SETUP on the
+/* Issue the type-130 remote-control (MRP) data-channel stream SETUP on an
  * already-verified RTSP session, then attach the MRP sender to the returned
- * dataPort (DESIGN.md §8, the "combined/piggyback" model). This is
+ * dataPort (DESIGN.md §8). This is
  * best-effort decoration: any failure (SETUP non-200, no dataPort, connect or
- * handshake failure) logs and leaves p->mrp NULL / audio untouched. Reachable
- * only on a pair-verified session (Apple devices) — the DataStream keys derive
- * from this session's pair-verify shared secret. */
+ * handshake failure) logs and leaves p->mrp NULL / audio untouched. The
+ * DataStream keys derive from the active HAP session secret, which is available
+ * for both pair-verified and transient HomePod sessions. */
 static void ap2_native_setup_mrp(struct ap2cl_s *p)
 {
-    if (!p->hap || !p->auth_credentials) return;   /* pair-verified only */
+    if (!p->hap) return;
 
     /* Random seed < 2^63: our plist writer stores signed int64 and Apple's own
      * plist ints are signed at that width. The DataStream HKDF salt is
@@ -1562,13 +1572,14 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     LOG_INFO("[MRP] type-130 data-channel SETUP OK (dataPort=%d, seed=%llu)",
              data_port, (unsigned long long)seed);
 
-    /* Bind the sender to THIS session's pair-verify shared secret and open the
+    /* Bind the sender to THIS session's HAP shared secret and open the
      * channel (TCP connect + DEVICE_INFO-first handshake). */
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid,
-                                ap2_hap_get_shared_secret(p->hap));
+                                ap2_hap_get_shared_secret(p->hap),
+                                ap2_hap_get_shared_secret_len(p->hap));
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
@@ -1818,6 +1829,120 @@ static bool ap2_native_pair(struct ap2cl_s *p)
     ap2_set_connect_error(p, AP2_CONNECT_ERROR_AUTH_FAILED,
                           password_status ? password_status : pin_err.http_status,
                           "device rejected the supplied password");
+    return false;
+}
+
+/* MediaRemote uses its own RTSP session. Reusing the audio session's event
+ * socket is accepted initially by HomePod, but both the type-130 and event
+ * channels are closed as soon as now-playing state is registered. */
+static bool ap2_native_setup_mrp_sidecar(struct ap2cl_s *p)
+{
+    struct ap2cl_s *side = ap2cl_create(
+        &p->device, &p->format, p->auth_credentials, p->password,
+        p->dacp_id, p->active_remote, p->lead_ms, p->volume);
+    if (!side) return false;
+    side->flow = FLOW_NATIVE_AP2;
+    if (p->iface) side->iface = strdup(p->iface);
+    if (p->publish_ip) side->publish_ip = strdup(p->publish_ip);
+
+    side->bind_addr.s_addr = INADDR_ANY;
+    if (side->iface) {
+        char *ifname = NULL;
+        uint32_t netmask;
+        side->bind_addr = get_interface(side->iface, &ifname, &netmask);
+        NFREE(ifname);
+    }
+    if (!ap2_native_open_socket(side)) goto fail;
+
+    struct sockaddr_in local;
+    socklen_t local_len = sizeof(local);
+    if (getsockname(side->sock_fd, (struct sockaddr *)&local, &local_len) != 0)
+        goto fail;
+    char local_addr[INET_ADDRSTRLEN];
+    if (!inet_ntop(AF_INET, &local.sin_addr, local_addr, sizeof(local_addr)))
+        goto fail;
+    RAND_bytes((uint8_t *)&side->session_id, sizeof(side->session_id));
+    snprintf(side->session_url, sizeof(side->session_url), "rtsp://%s/%u",
+             local_addr, side->session_id);
+    ap2_gen_uuid(side->session_uuid);
+    ap2_gen_uuid(side->group_uuid);
+
+    if (!ap2_native_get_info(side) || !ap2_native_pair(side)) goto fail;
+
+    uint8_t id_bytes[8] = {0};
+    ap2_dacp_bytes(p->dacp_id, id_bytes);
+    char device_id[24];
+    char mac_address[18];
+    ap2_colon_hex(id_bytes, 8, device_id);
+    ap2_colon_hex(id_bytes, 6, mac_address);
+
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "isRemoteControlOnly", ap2_pl_bool(true));
+    ap2_pl_dict_set(root, "osName", ap2_pl_string("iPhone OS"));
+    ap2_pl_dict_set(root, "sourceVersion", ap2_pl_string("550.10"));
+    ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("None"));
+    ap2_pl_dict_set(root, "model", ap2_pl_string("iPhone17,1"));
+    ap2_pl_dict_set(root, "deviceID", ap2_pl_string(device_id));
+    ap2_pl_dict_set(root, "osVersion", ap2_pl_string("18.0"));
+    ap2_pl_dict_set(root, "osBuildVersion", ap2_pl_string("22A3354"));
+    ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_address));
+    ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(side->session_uuid));
+    ap2_pl_dict_set(root, "name", ap2_pl_string("Music Assistant"));
+    uint8_t *setup_body = NULL;
+    int setup_len = ap2_pl_serialize(root, &setup_body);
+    ap2_pl_free(root);
+
+    uint8_t *resp = NULL;
+    int resp_len = 0;
+    int status = ap2_rtsp_send(
+        side, "SETUP", side->session_url, setup_body, setup_len,
+        "application/x-apple-binary-plist", &resp, &resp_len);
+    free(setup_body);
+    if (status != 200) {
+        free(resp);
+        goto fail;
+    }
+
+    uint64_t event_port = 0;
+    bool have_event_port = resp && resp_len > 0 &&
+        ap2_bplist_find_uint(resp, (size_t)resp_len, "eventPort", &event_port);
+    free(resp);
+    if (!have_event_port || event_port < 1024 || event_port > 65535) goto fail;
+
+    side->events_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (side->events_sock < 0) goto fail;
+    struct sockaddr_in event_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons((uint16_t)event_port),
+    };
+    inet_pton(AF_INET, side->device.address, &event_addr.sin_addr);
+    if (connect(side->events_sock, (struct sockaddr *)&event_addr,
+                sizeof(event_addr)) != 0)
+        goto fail;
+    int one = 1;
+    setsockopt(side->events_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    resp = NULL;
+    resp_len = 0;
+    status = ap2_rtsp_send(side, "RECORD", side->session_url, NULL, 0, NULL,
+                           &resp, &resp_len);
+    free(resp);
+    if (status != 200) goto fail;
+
+    ap2_native_setup_mrp(side);
+    if (!side->mrp || !ap2_mrp_is_connected(side->mrp)) goto fail;
+
+    p->mrp = side->mrp;
+    side->mrp = NULL;
+    p->mrp_sidecar = side;
+    ap2_mrp_set_remote_command_callback(
+        p->mrp, ap2_remote_command_received, p);
+    LOG_INFO("[MRP] independent remote-control session established");
+    return true;
+
+fail:
+    LOG_WARN("[MRP] independent remote-control session setup failed");
+    ap2cl_destroy(side);
     return false;
 }
 
@@ -2359,15 +2484,11 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 #undef AP2_MAX_SETPEERS
     }
 
-    /* 6b. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
-     * sender delivers now-playing over POST /command, NOT the type-130 channel
-     * (its type-130 SETUPs never completed a data connection), and pushing state
-     * over type-130 competes with /command. So the type-130 channel is OFF by
-     * default; now-playing rides /command (ap2cl_mrp_register + ap2cl_mrp_push).
-     * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
-     * control RX). Best-effort; audio is up regardless. */
+    /* 6b. MRP now-playing. The default compatibility path uses POST /command;
+     * the opt-in type-130 path carries the same state in SET_STATE protobufs.
+     * Keep setup best-effort so a failed now-playing channel cannot stop audio. */
     if (ap2_mrp_type130_enabled())
-        ap2_native_setup_mrp(p);
+        ap2_native_setup_mrp_sidecar(p);
 
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
@@ -2521,7 +2642,27 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->lead_ms * 1000000ULL;
+            /* A HomePod-led group uses the receiver's PTP clock domain. Its
+             * timestamps are not Unix epoch values, so the shared daemon
+             * exposes a large local->master offset (roughly -CLOCK_REALTIME).
+             * The START command is still expressed in Unix milliseconds by MA;
+             * translate that instant into the elected master's domain before
+             * subtracting the sender lead. Without this conversion the receiver
+             * schedules audio about 56,000 years in the future: the session is
+             * lit and RTP is sent, but no sample becomes audible. */
+            uint64_t local_now = ap2_ptp_now_ns(p->ptp);
+            int64_t master_offset = wall >= local_now
+                                  ? (int64_t)(wall - local_now)
+                                  : -(int64_t)(local_now - wall);
+            int64_t master_start = (int64_t)unix_ns + master_offset;
+            if (master_start < 0) {
+                LOG_ERROR("[AP2] PTP master start conversion underflow: "
+                          "unix_ns=%" PRIu64 " offset=%" PRId64,
+                          unix_ns, master_offset);
+                master_start = (int64_t)wall;
+            }
+            p->rt_anchor_wall0 = (uint64_t)master_start
+                                - (uint64_t)p->lead_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + atomic_load(&p->rtp_offset);
         } else {
@@ -3188,6 +3329,11 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->state != AP2_DOWN || p->sock_fd >= 0)
         ap2cl_disconnect(p);
     ap2_raop_session_cleanup(p);
+    if (p->mrp_sidecar) {
+        struct ap2cl_s *sidecar = p->mrp_sidecar;
+        p->mrp_sidecar = NULL;
+        ap2cl_destroy(sidecar);
+    }
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     if (p->mrp) ap2_mrp_destroy(p->mrp);
@@ -3411,6 +3557,11 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
             atomic_store(&p->mrp_event_health, 0);
         }
         pthread_mutex_unlock(&p->mrp_publish_lock);
+        if (p->mrp_sidecar) {
+            struct ap2cl_s *sidecar = p->mrp_sidecar;
+            p->mrp_sidecar = NULL;
+            ap2cl_destroy(sidecar);
+        }
         if (p->events_sock >= 0) {
             close(p->events_sock);
             p->events_sock = -1;
@@ -4740,6 +4891,8 @@ bool ap2cl_feedback(struct ap2cl_s *p)
     } else {
         LOG_DEBUG("[AP2] /feedback keepalive -> %d", status);
     }
+    if (p->mrp_sidecar && !ap2cl_feedback(p->mrp_sidecar))
+        LOG_WARN("[MRP] remote-control session /feedback failed");
     /* Service event/DataStream input after the receiver keepalive itself.
      * State output takes the publication lock only when immediately available,
      * so metadata work can never delay the next feedback cadence. */
@@ -4804,11 +4957,21 @@ bool ap2cl_control_healthy(struct ap2cl_s *p)
     return atomic_load(&p->mrp_event_health) != 0;
 }
 
+static bool ap2_mrp_channel_active(struct ap2cl_s *p);
+
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
 {
     if (!p) return false;
     p->volume = volume;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        if (ap2_mrp_channel_active(p)) {
+            /* HomePod closes the native RTSP control channel when a volume
+             * SET_PARAMETER follows a type-130 now-playing setup. Keep the
+             * requested value for the next session; the active channel has no
+             * volume message in our current protobuf surface. */
+            LOG_INFO("[AP2] native volume deferred while type-130 channel is active");
+            return true;
+        }
         /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
          * over -30..0, mute at 0. This is the AirPlay convention (iOS,
          * shairport-sync use the same range), so a given slider position is
@@ -4893,20 +5056,28 @@ static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
                                      : AP2_MRP_PLAYBACK_STOPPED;
 }
 
-/* Lazily create MediaRemote for pair-verified native sessions and attach the
- * encrypted reverse event channel before advertising any controllable state.
- * Transient-paired third-party speakers never receive these Apple-specific
- * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
+static bool ap2_mrp_session_eligible(const struct ap2cl_s *p)
+{
+    return p && p->flow == FLOW_NATIVE_AP2 &&
+           (p->auth_credentials || p->apple_model);
+}
+
+/* Lazily create MediaRemote for pair-verified native sessions and transient
+ * Apple receivers, then attach the encrypted reverse event channel before
+ * advertising any controllable state. Transient-paired third-party speakers
+ * never receive these Apple-specific messages. Set CLIAIRPLAY_MRP=0 to disable
+ * the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+    if (p->mrp || !ap2_mrp_session_eligible(p) ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
     if (!ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name,
                             p->session_uuid, p->group_uuid,
-                            ap2_hap_get_shared_secret(p->hap));
+                            ap2_hap_get_shared_secret(p->hap),
+                            ap2_hap_get_shared_secret_len(p->hap));
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
@@ -4955,6 +5126,14 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
                                 ap2_mrp_command_builder_t builder,
                                 const char *tag)
 {
+    /* Once type-130 is connected, /command is a compatibility fallback only.
+     * A late command-path publisher can race the channel setup; suppress it
+     * here as the final transport boundary so HomePod never sees duplicate
+     * now-playing messages on both encrypted channels. */
+    if (p && ap2_mrp_type130_enabled() && !ap2_mrp_type130_dual_enabled() &&
+        p->mrp &&
+        ap2_mrp_is_connected(p->mrp))
+        return 200;
     uint8_t *body = NULL; int body_len = 0;
     pthread_mutex_lock(&p->mrp_lock);
     bool built = p->mrp && builder(p->mrp, &body, &body_len);
@@ -4972,6 +5151,28 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
     return status;
 }
 
+/* The type-130 session is the native now-playing transport when it is up.
+ * Keep this check in one place so metadata, progress and playback transitions
+ * cannot accidentally publish the same state over both transports. */
+static bool ap2_mrp_channel_active(struct ap2cl_s *p)
+{
+    return p && ap2_mrp_type130_enabled() && p->mrp &&
+           ap2_mrp_is_connected(p->mrp);
+}
+
+/* The feedback worker owns type-130 writes. Callers only mark the MRP state
+ * dirty; sending a second frame immediately after the handshake makes HomePod
+ * close the data channel before the audio feed starts. */
+static ap2_mrp_push_result_t ap2cl_mrp_push_channel_serialized(
+       struct ap2cl_s *p)
+{
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    result.overall_status = 200;
+    result.nowplaying_status = 200;
+    LOG_INFO("[MRP] type-130 SET_STATE push queued for feedback worker");
+    return result;
+}
+
 static bool ap2_mrp_status_ok(int status)
 {
     return status >= 200 && status < 300;
@@ -4983,6 +5184,8 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 {
     if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
         return -1;
+    if (ap2_mrp_channel_active(p) && !ap2_mrp_type130_dual_enabled())
+        return 200;
     if (!force && p->mrp_last_playback_state == state) return 200;
 
     int status = ap2_mrp_post_command(
@@ -5070,8 +5273,14 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized_with(
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    bool channel_active = ap2_mrp_channel_active(p);
     pthread_mutex_unlock(&p->mrp_lock);
     if (!have_mrp) return result;
+
+    if (channel_active) {
+        result = ap2cl_mrp_push_channel_serialized(p);
+        if (!ap2_mrp_type130_dual_enabled()) return result;
+    }
 
     if (!p->mrp_device_registered && ap2cl_mrp_register_serialized(p) != 1) {
         result.overall_status = 0;
@@ -5156,10 +5365,10 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p)
  *    1 = channel established (now-playing active). */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return -1;
+    if (!p || p->flow != FLOW_NATIVE_AP2 ||
+        (!p->auth_credentials && !p->apple_model)) return -1;
     /* The type-130 channel is opt-in (see ap2_native_connect §6b); when it is
-     * not attempted, report "not applicable" so the [STATUS] path=channel line
-     * is suppressed and only path=command (the active now-playing path) shows. */
+     * not attempted, report "not applicable" so the channel status is omitted. */
     if (!ap2_mrp_type130_enabled()) return -1;
     pthread_mutex_lock(&p->mrp_lock);
     int status = (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
@@ -5176,8 +5385,13 @@ static int ap2cl_mrp_register_serialized(struct ap2cl_s *p)
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    bool channel_active = ap2_mrp_channel_active(p);
     pthread_mutex_unlock(&p->mrp_lock);
     if (!have_mrp) return -1;
+    if (channel_active && !ap2_mrp_type130_dual_enabled()) {
+        p->mrp_device_registered = true;
+        return 1;
+    }
     if (p->mrp_device_registered) return 1;
 
     int status = ap2_mrp_post_command(
@@ -5242,6 +5456,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    bool channel_active = ap2_mrp_channel_active(p);
     bool track_changed = false;
     if (p->mrp)
         ap2_mrp_set_track(p->mrp, title, artist, album, duration * 1000,
@@ -5251,7 +5466,9 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     if (track_changed_out) *track_changed_out = track_changed;
 
     bool dmap_ok;
-    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
+    if (channel_active)
+        dmap_ok = true;
+    else if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
         dmap_ok = ap2_native_send_metadata(p, title, artist, album);
     else if (p->raopcl)
         dmap_ok = raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
@@ -5263,7 +5480,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * Sonos-class receivers key it to the track they were just told about.
      * Only a same-item redundant image (MRP verdict "unchanged") is skipped,
      * matching ap2cl_set_artwork; MRP-rejected bytes still go out on DMAP. */
-    if (have_art && (!have_mrp || track_changed ||
+    if (have_art && !channel_active && (track_changed ||
                      mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
         ap2_send_dmap_artwork(p, content_type, art_len,
                               (const char *)art_data);
@@ -5301,6 +5518,7 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    bool channel_active = ap2_mrp_channel_active(p);
     if (p->mrp)
         ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
                             size, mrp_info);
@@ -5312,7 +5530,8 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         pthread_mutex_unlock(&p->mrp_publish_lock);
         return true;
     }
-    bool dmap_ok = ap2_send_dmap_artwork(p, content_type, size, data);
+    bool dmap_ok = channel_active ? true
+                            : ap2_send_dmap_artwork(p, content_type, size, data);
     if (have_mrp) {
         ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
         if (mrp_push) *mrp_push = result;
@@ -5684,6 +5903,16 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
 bool ap2cl_test_apple_model_default(const char *txt, const char *am)
 {
     return ap2_apple_model(txt, am);
+}
+
+bool ap2cl_test_mrp_session_eligible(bool native, bool authenticated, bool apple)
+{
+    struct ap2cl_s client = {
+        .flow = native ? FLOW_NATIVE_AP2 : FLOW_RAOP_COMPAT,
+        .auth_credentials = authenticated ? "credentials" : NULL,
+        .apple_model = apple,
+    };
+    return ap2_mrp_session_eligible(&client);
 }
 
 bool ap2cl_test_env_enabled(const char *name, bool unset_default)

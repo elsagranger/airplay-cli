@@ -121,7 +121,7 @@ static struct ap2_mrp_ctx *create_mrp_with_callback(
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
         "Music Assistant", "11111111-2222-4333-8444-555555555555",
-        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret, KEY_SIZE);
     assert(mrp);
     ap2_mrp_set_remote_command_callback(mrp, callback, userdata);
     assert(ap2_mrp_attach_events(mrp, event_sock));
@@ -283,7 +283,7 @@ static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
         "Music Assistant", "11111111-2222-4333-8444-555555555555",
-        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret, KEY_SIZE);
     assert(mrp);
 
     assert(ap2_mrp_set_artwork(

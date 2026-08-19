@@ -81,14 +81,11 @@ typedef struct {
 /*
  * Create an MRP sender context.
  *
- * Two attachment models (DESIGN.md §8):
- *  - piggyback: the audio session (ap2_client.c) issues the extra stream SETUP
- *    (type 130) on its already-verified RTSP channel and hands the returned
- *    dataPort to ap2_mrp_attach(). The channel keys derive from THAT session's
- *    pair-verify shared secret, passed here as reuse_shared_secret.
- *  - sidecar (metadata-only display mode): ap2_mrp_start() later drives its own
- *    connection + pair-verify + remote-control-only session; not implemented in
- *    the current implementation.
+ * The normal attachment model is a sidecar RTSP session: ap2_client.c opens an
+ * independent remote-control-only connection, performs HAP verification, and
+ * hands the returned event socket and type-130 dataPort to this context. The
+ * audio session remains independent so registering now-playing state cannot
+ * reset audio playback. A piggyback attach is retained for compatibility.
  *
  * :param host: device IP address.
  * :param port: device AirPlay control port (typically 7000).
@@ -101,9 +98,8 @@ typedef struct {
  * :param device_name: sender display name to advertise (DEVICE_INFO).
  * :param session_uuid: UUID of the AirPlay audio session this state belongs to.
  * :param group_uuid: AirPlay group UUID advertised in the session SETUP.
- * :param reuse_shared_secret: 32-byte pairing shared secret of the verified
- *                             session the type-130 stream was SETUP on
- *                             (piggyback model). NULL for the sidecar model.
+ * :param reuse_shared_secret: pairing shared secret of the verified session.
+ * :param reuse_shared_secret_len: 32 for pair-verify, 64 for transient SRP.
  */
 struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *auth_credentials,
@@ -111,16 +107,17 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *device_name,
                                     const char *session_uuid,
                                     const char *group_uuid,
-                                    const uint8_t *reuse_shared_secret);
+                                    const uint8_t *reuse_shared_secret,
+                                    size_t reuse_shared_secret_len);
 
 /* Destroy the context and release all resources. */
 void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 
 /*
- * Attach to a remote-control data channel negotiated by the audio session
- * (piggyback model). Derives the DataStream channel keys from the shared
- * secret given at create time, opens the TCP connection to the receiver's
- * dataPort, and pushes the opening messages (DEVICE_INFO,
+ * Attach to a remote-control data channel negotiated by an RTSP session.
+ * Derives the DataStream channel keys from the session shared secret given at
+ * create time, opens the TCP connection to the receiver's dataPort, and
+ * pushes the opening messages (DEVICE_INFO,
  * SET_CONNECTION_STATE, SET_NOW_PLAYING_CLIENT, initial SET_STATE).
  *
  * :param data_port: dataPort from the type-130 stream SETUP response.
@@ -138,10 +135,9 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
 /*
- * Bootstrap a standalone remote-control-only session (sidecar model, for the
- * metadata-only display mode): own TCP connection, pair-verify, session SETUP
- * with isRemoteControlOnly=true, event channel, RECORD, type-130 data channel.
- * Not implemented yet — returns false.
+ * Bootstrap a standalone remote-control-only session. The current client
+ * establishes this RTSP session in ap2_client.c so it can share the audio
+ * lifecycle while keeping control traffic isolated from audio.
  */
 bool ap2_mrp_start(struct ap2_mrp_ctx *m);
 

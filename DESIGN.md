@@ -600,19 +600,30 @@ tvOS draws its on-screen now-playing UI only from **MediaRemote** state, not
 from the DMAP metadata that speakers consume over RTSP `SET_PARAMETER` (the
 Apple TV 200-accepts that metadata but never renders it; the DMAP path stays,
 because Sonos-class speakers require and consume it). Pair-verified native
-sessions therefore additionally push MediaRemote now-playing, so an Apple TV
-renders our stream the way it renders an iPhone sender. Maintaining that
+sessions and transient-paired Apple receivers therefore additionally push
+MediaRemote now-playing, so an Apple receiver can associate the audio session
+with sender state. Maintaining that
 session also keeps tvOS awake mid-stream: tvOS treats the MediaRemote
 now-playing session, not raw RTP flow, as playback activity. The path is gated
-to pair-verified native sessions — Apple devices in practice — since
-transient-paired and third-party receivers neither need nor render it.
+to pair-verified native sessions or receivers whose advertised model identifies
+them as Apple hardware. Transient-paired third-party receivers neither need nor
+receive it.
 `CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
+
+Some HomePod software requires the legacy MediaRemote registration messages
+before Home exposes the session as controllable. Set
+`CLIAIRPLAY_MRP_TYPE130_DUAL=1` to keep the type-130 `SET_STATE` stream while
+also sending `/command` registration and now-playing updates. Leave it unset
+for receivers that close the type-130 channel on duplicate state.
 
 **Transport — `POST /command`** on the main encrypted RTSP channel (same
 channel and HAP framing as `/feedback`), `Content-Type:
-application/x-apple-binary-plist`. This is the transport real Apple senders use
-for now-playing; the type-130 data channel below is *not* used for it. On
-connect the sender emits the initial sequence from AirPlaySender's
+application/x-apple-binary-plist`. This is the compatibility transport used
+when the type-130 channel is unavailable. When type-130 is connected, the same
+state is sent as encrypted `SET_STATE` protobufs instead, and the sender skips
+the duplicate `/command` and legacy DMAP metadata writes unless
+`CLIAIRPLAY_MRP_TYPE130_DUAL=1` is enabled. On the command path,
+connect emits the initial sequence from AirPlaySender's
 `metadataSender_sendInitialMetadataInternal`:
 
 1. **DEVICE_INFO** — `type=None`, body `{params:{data:<protobuf>}}` carrying an
@@ -640,7 +651,7 @@ state-only. A receiver demoted to full replace pushes (update-policy
 rejection, below) gets the artwork-bearing replace shape at pause/resume too:
 the correct frozen elapsed is judged worth the re-render on such receivers,
 none of which have been observed in practice. The ~15 s defensive state
-re-push belongs to the type-130 channel below, which is off by default.
+re-push belongs to the type-130 channel below.
 
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
 is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
@@ -796,21 +807,23 @@ identifiers use MRMediaRemoteCommand numbering, which is not pyatv's `Command`
 enum** — the two enumerations disagree, so the wire values here
 (0,1,2,3,4,5,8,9,10,11,17,18,24,25,26) are Apple's, not pyatv's.
 
-**Type-130 remote-control channel — off by default.** A dedicated
+**Type-130 now-playing and remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
-DataStream keys derived from the pair-verify shared secret) exists for *inbound*
-remote control (Siri-remote play/pause). It is off by default because the real
-sender pushes now-playing over `/command`; `CLIAIRPLAY_MRP_TYPE130=1` enables
-it. Its value is parsed the same way as `CLIAIRPLAY_MRP`, so `0`/`false`/`off`
-keep it off. Its outbound `SET_STATE` does carry a full now-playing picture —
-title/artist/album, duration, elapsed time, playback state and the artwork
-bytes — and while the channel is up and playback is PLAYING the feedback worker
-re-pushes it every 15 s (`MRP_STATE_REPUSH_S`) as a defensive refresh. That
-push is skipped while the channel is down, which is why the default path has no
-periodic state refresh. `src/ap2_mrp.c` hand-rolls the
-proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
-DataStream key derivation and channel framing, and answers inbound `sync`
-frames with `rply`.
+DataStream keys derived from the HAP session secret) exists for *inbound*
+remote control (Siri-remote play/pause) and outbound now-playing state. The
+client opens it on an independent remote-control-only RTSP sidecar session;
+this prevents registering now-playing state from resetting the audio session.
+The HAP secret input is 32 bytes for pair-verify credentials and the full
+64-byte SRP session key for transient PIN pairing. It is off by default for
+compatibility; `CLIAIRPLAY_MRP_TYPE130=1` enables it. Its value is parsed the
+same way as `CLIAIRPLAY_MRP`, so `0`/`false`/`off` keep it off. Once the channel
+is up, `SET_STATE` carries the full now-playing picture and the sender does not
+also publish `/command` or legacy DMAP metadata. The feedback worker re-pushes
+it every 15 s (`MRP_STATE_REPUSH_S`) as a defensive refresh. That push is
+skipped while the channel is down, which is why the default path has no
+periodic state refresh. `src/ap2_mrp.c` hand-rolls the proto2 emitters, the
+`/command` builders, the bplist `params.data` wrapper, the DataStream key
+derivation and channel framing, and answers inbound `sync` frames with `rply`.
 
 ## 9. Buffered audio (type 103)
 
