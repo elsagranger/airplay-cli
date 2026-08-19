@@ -93,6 +93,14 @@ extern log_level *loglevel;
 #define PTP_LOG_VARIANCE    0x436A
 #define PTP_TIME_SOURCE     0x20            /* GPS */
 
+/* Dataset used by a Mac sender when it deliberately yields BMCA to a HomePod
+ * (observed HomePod priority1 is 248, so the higher value loses). */
+#define PTP_GROUP_PRIORITY1       250
+#define PTP_GROUP_CLOCK_CLASS     248
+#define PTP_GROUP_CLOCK_ACCURACY  0xFE
+#define PTP_GROUP_LOG_VARIANCE    0xFFFF
+#define PTP_GROUP_TIME_SOURCE     0xA0
+
 #define PTP_ANNOUNCE_INTERVAL_NS  1000000000ULL   /* 1 s   -> logInterval 0  */
 #define PTP_SYNC_INTERVAL_NS       125000000ULL   /* 125 ms -> logInterval -3 */
 #define PTP_LOG_ANNOUNCE_INTERVAL  0
@@ -172,13 +180,17 @@ struct ap2_ptp_ctx {
     /* ---- BMCA / slave state (guarded by lock) ---- */
     pthread_mutex_t lock;
     bool is_grandmaster;            /* true: we drive the timeline; false: slaved to a peer */
-    /* The AirPlay sender is the session's timing authority: receivers only
-     * consider masters from the SETPEERS timing-peer list (i.e. us) and cannot
-     * follow their own clock, so surrendering the timeline mutes them. With
-     * hold_master (the default) a competing Announce is recorded but never
-     * wins the election; the BMCA/slave machinery below stays available for
-     * diagnostics and the synthetic harness. */
+    /* Solo playback keeps the sender as timing authority for broad receiver
+     * compatibility. Native HomePod groups explicitly disable hold_master and
+     * use Mac-style BMCA so the leader receiver owns the shared timeline. */
     bool hold_master;
+    uint8_t priority1;
+    uint8_t clock_class;
+    uint8_t clock_accuracy;
+    uint16_t clock_variance;
+    uint8_t time_source;
+    struct in_addr preferred_master;
+    bool preferred_master_set;
     bool hold_notice_logged;        /* one INFO line per session about an ignored peer GM */
     bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
     bool peer_kick;                 /* send timing immediately after peer registration */
@@ -210,6 +222,9 @@ struct ap2_ptp_ctx {
     bool shm_active;
     struct ap2_ptp_shm_reader shm_reader;
     char *shared_ip;                /* receiver IP registered with the daemon (for unregister) */
+    char *shared_group_ips[PTP_MAX_PEERS];
+    int shared_group_count;
+    bool shared_group_registered;
 };
 
 /* ---- NTP timing responder ---- */
@@ -339,8 +354,12 @@ static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
     int npeers = 0;
     pthread_mutex_lock(&ctx->lock);
     bool unicast_mirror = ctx->unicast_mirror;
-    for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++)
-        if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) == 1) npeers++;
+    if (!ctx->hold_master && ctx->preferred_master_set) {
+        peers[npeers++] = ctx->preferred_master;
+    } else {
+        for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++)
+            if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) == 1) npeers++;
+    }
     pthread_mutex_unlock(&ctx->lock);
 
     bool sent = false;
@@ -364,6 +383,50 @@ static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
  * payload starts 00 00 03 01, remainder zero. 106 bytes total. */
 static void ptp_send_signaling(struct ap2_ptp_ctx *ctx)
 {
+    pthread_mutex_lock(&ctx->lock);
+    bool group_mode = !ctx->hold_master;
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (group_mode) {
+        /* airplay2-rs' Mac-style negotiation: 802.1AS interval request first,
+         * followed by Apple's subtype 1/5 extensions with 0x2710 values. */
+        uint16_t len = PTP_HDR_LEN + 10 + 14 + 26 + 36;
+        uint8_t b[PTP_HDR_LEN + 10 + 14 + 26 + 36];
+        memset(b, 0, sizeof(b));
+        ptp_write_hdr(b, PTP_MSG_SIGNALING, len, 0, ctx->clock_id,
+                      ctx->signaling_seq, 0x05, 0x7F);
+        memset(b + PTP_HDR_LEN, 0xFF, 10);
+        uint8_t *tlv = b + PTP_HDR_LEN + 10;
+        const uint8_t interval[] = {
+            0x00, 0x03, 0x00, 0x0A, 0x00, 0x80, 0xC2,
+            0x00, 0x00, 0x02, 0xFD, 0xFD, 0xFE, 0x02,
+        };
+        memcpy(tlv, interval, sizeof(interval));
+        tlv += sizeof(interval);
+        tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x16;
+        tlv[4] = 0x00; tlv[5] = 0x0D; tlv[6] = 0x93;
+        tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x01;
+        const uint8_t apple_01[] = {
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x27, 0x10,
+            0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00,
+        };
+        memcpy(tlv + 10, apple_01, sizeof(apple_01));
+        tlv += 26;
+        tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x20;
+        tlv[4] = 0x00; tlv[5] = 0x0D; tlv[6] = 0x93;
+        tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x05;
+        const uint8_t apple_05[] = {
+            0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x27, 0x10,
+            0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        };
+        memcpy(tlv + 10, apple_05, sizeof(apple_05));
+        ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
+        ctx->signaling_seq++;
+        return;
+    }
+
     uint16_t len = PTP_HDR_LEN + 10 + 26 + 36;
     uint8_t b[PTP_HDR_LEN + 10 + 26 + 36];
     memset(b, 0, sizeof(b));
@@ -385,6 +448,26 @@ static void ptp_send_signaling(struct ap2_ptp_ctx *ctx)
     ctx->signaling_seq++;
 }
 
+static void ptp_send_stop_signaling(struct ap2_ptp_ctx *ctx,
+                                    const struct sockaddr_in *peer)
+{
+    uint16_t len = PTP_HDR_LEN + 10 + 14;
+    uint8_t b[PTP_HDR_LEN + 10 + 14];
+    memset(b, 0, sizeof(b));
+    ptp_write_hdr(b, PTP_MSG_SIGNALING, len, 0, ctx->clock_id,
+                  ctx->signaling_seq, 0x05, 0x7F);
+    memset(b + PTP_HDR_LEN, 0xFF, 10);
+    const uint8_t stop[] = {
+        0x00, 0x03, 0x00, 0x0A, 0x00, 0x80, 0xC2,
+        0x00, 0x00, 0x02, 0x7E, 0x7E, 0x7E, 0x00,
+    };
+    memcpy(b + PTP_HDR_LEN + 10, stop, sizeof(stop));
+    struct sockaddr_in dst = *peer;
+    dst.sin_port = htons(PTP_GENERAL_PORT);
+    sendto(ctx->general_sock, b, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    ctx->signaling_seq++;
+}
+
 static void ptp_send_announce(struct ap2_ptp_ctx *ctx)
 {
     /* iOS-shaped Announce: flags UNICAST|TIMESCALE, originTimestamp 0,
@@ -394,19 +477,27 @@ static void ptp_send_announce(struct ap2_ptp_ctx *ctx)
     uint16_t len = PTP_HDR_LEN + 30 + 12;
     ptp_write_hdr(b, PTP_MSG_ANNOUNCE, len, PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE,
                   ctx->clock_id, ctx->announce_seq, 0x00, PTP_LOG_ANNOUNCE_INTERVAL);
+    pthread_mutex_lock(&ctx->lock);
+    uint8_t priority1 = ctx->priority1;
+    uint8_t clock_class = ctx->clock_class;
+    uint8_t clock_accuracy = ctx->clock_accuracy;
+    uint16_t clock_variance = ctx->clock_variance;
+    uint8_t time_source = ctx->time_source;
+    pthread_mutex_unlock(&ctx->lock);
+
     uint8_t *body = b + PTP_HDR_LEN;
     memset(body, 0, 10);                          /* originTimestamp = 0 (as iOS) */
     body[10] = 0; body[11] = 0;                   /* currentUtcOffset = 0 (as iOS) */
     body[12] = 0;                                 /* reserved */
-    body[13] = PTP_PRIORITY1;
-    body[14] = PTP_CLOCK_CLASS;
-    body[15] = PTP_CLOCK_ACCURACY;
-    body[16] = (PTP_LOG_VARIANCE >> 8) & 0xFF;
-    body[17] = PTP_LOG_VARIANCE & 0xFF;
+    body[13] = priority1;
+    body[14] = clock_class;
+    body[15] = clock_accuracy;
+    body[16] = (clock_variance >> 8) & 0xFF;
+    body[17] = clock_variance & 0xFF;
     body[18] = PTP_PRIORITY2;
     for (int i = 0; i < 8; i++) body[19 + i] = (ctx->clock_id >> (56 - 8 * i)) & 0xFF;
     body[27] = 0; body[28] = 0;                   /* stepsRemoved = 0 */
-    body[29] = PTP_TIME_SOURCE;
+    body[29] = time_source;
     /* PATH_TRACE TLV: type 0x0008, length 8, value = grandmaster clock id */
     body[30] = 0x00; body[31] = 0x08;
     body[32] = 0x00; body[33] = 0x08;
@@ -414,7 +505,7 @@ static void ptp_send_announce(struct ap2_ptp_ctx *ctx)
 
     ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
     LOG_DEBUG("[PTP] TX Announce seq=%u gm=%016" PRIx64 " prio1=%d", ctx->announce_seq,
-              ctx->clock_id, PTP_PRIORITY1);
+              ctx->clock_id, priority1);
     ctx->announce_seq++;
 }
 
@@ -680,10 +771,10 @@ static bool ptp_parse_announce(const uint8_t *buf, int n, struct ptp_dataset *ds
 /* Our own advertised dataset (mirrors what ptp_send_announce emits). */
 static void ptp_own_dataset(const struct ap2_ptp_ctx *ctx, struct ptp_dataset *ds)
 {
-    ds->priority1 = PTP_PRIORITY1;
-    ds->clock_class = PTP_CLOCK_CLASS;
-    ds->clock_accuracy = PTP_CLOCK_ACCURACY;
-    ds->offset_scaled_log_variance = PTP_LOG_VARIANCE;
+    ds->priority1 = ctx->priority1;
+    ds->clock_class = ctx->clock_class;
+    ds->clock_accuracy = ctx->clock_accuracy;
+    ds->offset_scaled_log_variance = ctx->clock_variance;
     ds->priority2 = PTP_PRIORITY2;
     ds->grandmaster_identity = ctx->clock_id;
     ds->steps_removed = 0;
@@ -739,9 +830,23 @@ static void ptp_apply_offset_sample(struct ap2_ptp_ctx *ctx, int64_t raw_offset)
 }
 
 /* Run BMCA against a freshly received peer Announce and (re)assign our role. */
-static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
-                                uint64_t rx_ns, const char *srcip)
+static bool ptp_accept_master_source(struct ap2_ptp_ctx *ctx, struct in_addr src)
 {
+    pthread_mutex_lock(&ctx->lock);
+    bool accept = !ctx->preferred_master_set ||
+                  ctx->preferred_master.s_addr == src.s_addr;
+    pthread_mutex_unlock(&ctx->lock);
+    return accept;
+}
+
+static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                                uint64_t rx_ns, const struct sockaddr_in *src,
+                                const char *srcip)
+{
+    if (!ptp_accept_master_source(ctx, src->sin_addr)) {
+        LOG_DEBUG("[PTP] Ignoring Announce from non-leader %s", srcip);
+        return;
+    }
     struct ptp_dataset peer;
     if (!ptp_parse_announce(buf, n, &peer)) return;
 
@@ -777,6 +882,11 @@ static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
         ctx->pending_sync_valid = false;
     }
     pthread_mutex_unlock(&ctx->lock);
+
+    if (!now_gm && was_gm) {
+        ptp_send_stop_signaling(ctx, src);
+        LOG_INFO("[PTP] Sent STOP Signaling to elected master %s", srcip);
+    }
 
     if (first_peer) {
         LOG_INFO("[PTP] Peer %s clock dataset: gm=%016" PRIx64 " prio1=%u class=%u "
@@ -978,14 +1088,16 @@ static void *ptp_thread_func(void *arg)
                 ptp_send_pdelay_resp(ctx, buf, rx, &src);
                 break;
             case PTP_MSG_ANNOUNCE:
-                ptp_handle_announce(ctx, buf, n, rx, srcip);
+                ptp_handle_announce(ctx, buf, n, rx, &src, srcip);
                 break;
             case PTP_MSG_SYNC:
                 /* Peer Sync only matters when we are slaving to it. */
-                if (!gm) ptp_handle_sync(ctx, buf, n, rx);
+                if (!gm && ptp_accept_master_source(ctx, src.sin_addr))
+                    ptp_handle_sync(ctx, buf, n, rx);
                 break;
             case PTP_MSG_FOLLOW_UP:
-                if (!gm) ptp_handle_follow_up(ctx, buf, n);
+                if (!gm && ptp_accept_master_source(ctx, src.sin_addr))
+                    ptp_handle_follow_up(ctx, buf, n);
                 break;
             case PTP_MSG_SIGNALING:
                 ptp_handle_signaling(ctx, buf, n, &src, srcip);
@@ -1009,11 +1121,15 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
     ctx->event_sock = -1;
     ctx->general_sock = -1;
     pthread_mutex_init(&ctx->lock, NULL);
-    /* Default to grandmaster and hold it: the sender owns the session timeline
-     * (see the hold_master field note), and the getters return a sane timeline
-     * before the engine ever runs. */
+    /* Default to grandmaster for the solo-device path. Native groups opt into
+     * receiver-led BMCA through the shared daemon control channel. */
     ctx->is_grandmaster = true;
     ctx->hold_master = true;
+    ctx->priority1 = PTP_PRIORITY1;
+    ctx->clock_class = PTP_CLOCK_CLASS;
+    ctx->clock_accuracy = PTP_CLOCK_ACCURACY;
+    ctx->clock_variance = PTP_LOG_VARIANCE;
+    ctx->time_source = PTP_TIME_SOURCE;
     /* Apple receivers consume the session clock as UNICAST PTP sent straight
      * to them (the nqptp model — they never join an open multicast election),
      * so mirror Announce/Sync/Follow_Up unicast to every timing peer from the
@@ -1028,11 +1144,25 @@ void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
     if (!ctx) return;
     ap2_ptp_stop(ctx);
     if (ctx->shm_active) {
-        if (ctx->shared_ip) ap2_ptp_shared_unregister(ctx, ctx->shared_ip);
+        if (ctx->shared_group_registered) {
+            char cmd[512] = "V";
+            size_t used = 1;
+            for (int i = 0; i < ctx->shared_group_count; i++) {
+                int written = snprintf(cmd + used, sizeof(cmd) - used, " %s",
+                                       ctx->shared_group_ips[i]);
+                if (written < 0 || (size_t)written >= sizeof(cmd) - used) break;
+                used += (size_t)written;
+            }
+            ap2_ptp_ctrl_send(cmd, 100, NULL, 0);
+        } else if (ctx->shared_ip) {
+            ap2_ptp_shared_unregister(ctx, ctx->shared_ip);
+        }
         ap2_ptp_shm_reader_close(&ctx->shm_reader);
         ctx->shm_active = false;
     }
     free(ctx->shared_ip);
+    for (int i = 0; i < ctx->shared_group_count; i++)
+        free(ctx->shared_group_ips[i]);
     for (int i = 0; i < ctx->npeers; i++) free(ctx->peers[i]);
     free(ctx->device_ip);
     pthread_mutex_destroy(&ctx->lock);
@@ -1251,12 +1381,16 @@ void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
         uint64_t deadline = ap2_ptp_now_ns(ctx) + (uint64_t)timeout_ms * 1000000ULL;
         struct ap2_ptp_shm_sample first;
         bool have_first = ap2_ptp_shm_read(&ctx->shm_reader, &first);
+        bool group_clock = ctx->shared_group_registered;
         while (ap2_ptp_now_ns(ctx) < deadline) {
             struct ap2_ptp_shm_sample s;
             if (ap2_ptp_shm_read(&ctx->shm_reader, &s) &&
                 (!have_first || s.update_count != first.update_count) &&
-                ((s.flags & AP2_PTP_SHM_F_GRANDMASTER) ||
-                 (s.flags & AP2_PTP_SHM_F_OFFSET_LOCKED)))
+                (group_clock
+                     ? (!(s.flags & AP2_PTP_SHM_F_GRANDMASTER) &&
+                        (s.flags & AP2_PTP_SHM_F_OFFSET_LOCKED))
+                     : ((s.flags & AP2_PTP_SHM_F_GRANDMASTER) ||
+                        (s.flags & AP2_PTP_SHM_F_OFFSET_LOCKED))))
                 break;
             usleep(10000);
         }
@@ -1383,6 +1517,15 @@ bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx)
     return ctx && ctx->shm_active;
 }
 
+bool ap2_ptp_shared_group_clock_ready(struct ap2_ptp_ctx *ctx)
+{
+    if (!ctx || !ctx->shm_active || !ctx->shared_group_registered) return false;
+    struct ap2_ptp_shm_sample s;
+    return ap2_ptp_shm_read(&ctx->shm_reader, &s) &&
+           !(s.flags & AP2_PTP_SHM_F_GRANDMASTER) &&
+           (s.flags & AP2_PTP_SHM_F_OFFSET_LOCKED);
+}
+
 bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx) return false;
@@ -1432,6 +1575,46 @@ void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip)
     LOG_DEBUG("[PTP] Unregistered receiver %s from daemon", ip);
 }
 
+void ap2_ptp_shared_register_group(struct ap2_ptp_ctx *ctx,
+                                   const char *const *ips, size_t count)
+{
+    if (!ctx || !ctx->shm_active || !ips || count < 2 ||
+        ctx->shared_group_count > 0)
+        return;
+
+    char cmd[512] = "G";
+    size_t used = 1;
+    for (size_t i = 0; i < count && ctx->shared_group_count < PTP_MAX_PEERS; i++) {
+        struct in_addr tmp;
+        if (!ips[i] || inet_pton(AF_INET, ips[i], &tmp) != 1) continue;
+        bool duplicate = false;
+        for (int j = 0; j < ctx->shared_group_count; j++)
+            if (strcmp(ctx->shared_group_ips[j], ips[i]) == 0) duplicate = true;
+        if (duplicate) continue;
+        int written = snprintf(cmd + used, sizeof(cmd) - used, " %s", ips[i]);
+        if (written < 0 || (size_t)written >= sizeof(cmd) - used) break;
+        char *copy = strdup(ips[i]);
+        if (!copy) break;
+        ctx->shared_group_ips[ctx->shared_group_count++] = copy;
+        used += (size_t)written;
+    }
+    if (ctx->shared_group_count < 2) {
+        for (int i = 0; i < ctx->shared_group_count; i++) {
+            free(ctx->shared_group_ips[i]);
+            ctx->shared_group_ips[i] = NULL;
+        }
+        ctx->shared_group_count = 0;
+        return;
+    }
+
+    char ack[128] = {0};
+    bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
+    ctx->shared_group_registered = ok;
+    LOG_INFO("[PTP] Registered receiver group (leader=%s, peers=%d) with daemon -> %s",
+             ctx->shared_group_ips[0], ctx->shared_group_count,
+             ok ? ack : "(no ack)");
+}
+
 void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx || !ctx->shm_active) return;
@@ -1446,6 +1629,54 @@ struct ptp_peerset {
     struct { char ip[INET_ADDRSTRLEN]; int refs; } e[PTP_MAX_PEERS];
     int n;
 };
+
+static void ptp_set_group_mode(struct ap2_ptp_ctx *ctx, bool enable,
+                               const char *leader_ip)
+{
+    pthread_mutex_lock(&ctx->lock);
+    bool was_enabled = !ctx->hold_master;
+    struct in_addr leader = {0};
+    bool have_leader = enable && leader_ip &&
+                       inet_pton(AF_INET, leader_ip, &leader) == 1;
+    bool leader_changed = have_leader &&
+                          (!ctx->preferred_master_set ||
+                           ctx->preferred_master.s_addr != leader.s_addr);
+    if (enable) {
+        ctx->hold_master = false;
+        ctx->priority1 = PTP_GROUP_PRIORITY1;
+        ctx->clock_class = PTP_GROUP_CLOCK_CLASS;
+        ctx->clock_accuracy = PTP_GROUP_CLOCK_ACCURACY;
+        ctx->clock_variance = PTP_GROUP_LOG_VARIANCE;
+        ctx->time_source = PTP_GROUP_TIME_SOURCE;
+        if (have_leader) {
+            ctx->preferred_master = leader;
+            ctx->preferred_master_set = true;
+        }
+    } else {
+        ctx->hold_master = true;
+        ctx->priority1 = PTP_PRIORITY1;
+        ctx->clock_class = PTP_CLOCK_CLASS;
+        ctx->clock_accuracy = PTP_CLOCK_ACCURACY;
+        ctx->clock_variance = PTP_LOG_VARIANCE;
+        ctx->time_source = PTP_TIME_SOURCE;
+        ctx->preferred_master.s_addr = 0;
+        ctx->preferred_master_set = false;
+    }
+    if (was_enabled != enable || leader_changed) {
+        ctx->is_grandmaster = true;
+        ctx->master_clock_id = ctx->clock_id;
+        ctx->master_offset_ns = 0;
+        ctx->have_offset = false;
+        ctx->have_peer = false;
+        ctx->pending_sync_valid = false;
+        ctx->hold_notice_logged = false;
+        ctx->peer_kick = true;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    if (was_enabled != enable || leader_changed)
+        LOG_INFO("[PTP] %s group BMCA%s%s", enable ? "Enabled" : "Disabled",
+                 have_leader ? "; leader=" : "", have_leader ? leader_ip : "");
+}
 
 static void peerset_apply(struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
 {
@@ -1508,7 +1739,8 @@ static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
 }
 
 /* Read and act on one control datagram; reply with a status ack. */
-static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
+static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps,
+                               struct ap2_ptp_ctx *ctx, int *group_refs)
 {
     char buf[512];
     struct sockaddr_in src;
@@ -1522,8 +1754,39 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
     if (!tok) return;
     char cmd = tok[0];
     bool changed = false;
+    bool group_changed = false;
+    char *group_leader = NULL;
 
     switch (cmd) {
+    case 'G': { /* register an ordered native receiver group */
+        char *ip;
+        int valid = 0;
+        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            struct in_addr tmp;
+            if (inet_pton(AF_INET, ip, &tmp) != 1) continue;
+            if (!group_leader) group_leader = ip;
+            peerset_add(ps, ip);
+            valid++;
+            changed = true;
+        }
+        if (valid >= 2) {
+            (*group_refs)++;
+            group_changed = true;
+        }
+        break;
+    }
+    case 'V': { /* unregister a native receiver group */
+        char *ip;
+        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            peerset_remove(ps, ip);
+            changed = true;
+        }
+        if (*group_refs > 0) {
+            (*group_refs)--;
+            group_changed = true;
+        }
+        break;
+    }
     case 'R':   /* register (add) */
     case 'T': { /* nqptp-compatible alias: ADD (see header note) */
         char *ip;
@@ -1574,16 +1837,23 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
     }
 
     if (changed) peerset_apply(ps, ctx);
+    if (group_changed)
+        ptp_set_group_mode(ctx, *group_refs > 0, group_leader);
 
     /* Ack with the current group state so a client can confirm the daemon is
      * live and see the elected grandmaster. */
     pthread_mutex_lock(&ctx->lock);
     bool gm = ctx->is_grandmaster;
     uint64_t cid = gm ? ctx->clock_id : ctx->master_clock_id;
+    bool locked = gm ? true : ctx->have_offset;
+    int64_t offset = gm ? 0 : ctx->master_offset_ns;
     pthread_mutex_unlock(&ctx->lock);
-    char ack[128];
-    int an = snprintf(ack, sizeof(ack), "OK peers=%d gm=%016" PRIx64 " role=%s",
-                      peerset_count(ps), cid, gm ? "grandmaster" : "slave");
+    char ack[192];
+    int an = snprintf(ack, sizeof(ack),
+                      "OK peers=%d groups=%d gm=%016" PRIx64
+                      " role=%s locked=%d offset_ns=%" PRId64,
+                      peerset_count(ps), *group_refs, cid,
+                      gm ? "grandmaster" : "slave", locked, offset);
     sendto(sock, ack, an, 0, (struct sockaddr *)&src, sl);
 }
 
@@ -1619,6 +1889,7 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
 
     uint64_t start_ns = ap2_ptp_now_ns(ctx);
     struct ptp_peerset ps = {0};
+    int group_refs = 0;
     LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
              AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
 
@@ -1631,7 +1902,7 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
         struct pollfd pfd = {.fd = ctrl, .events = POLLIN};
         int pr = poll(&pfd, 1, 100);   /* ~10 Hz publish cadence */
         if (pr > 0 && (pfd.revents & POLLIN))
-            daemon_handle_ctrl(ctrl, &ps, ctx);
+            daemon_handle_ctrl(ctrl, &ps, ctx, &group_refs);
         daemon_fill_sample(ctx, start_ns, &sample);
         ap2_ptp_shm_publish(&w, sample);
     }

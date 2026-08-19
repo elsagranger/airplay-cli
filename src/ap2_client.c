@@ -1916,8 +1916,14 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * the in-process engine — the single-device path, byte-for-byte. */
         if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
             p->use_ptp = true;
-            ap2_ptp_shared_register(p->ptp, p->device.address);
-            ap2_ptp_engine_settle(p->ptp, 400);
+            if (p->group_peer_count > 1)
+                ap2_ptp_shared_register_group(
+                    p->ptp, (const char *const *)p->group_peers,
+                    p->group_peer_count);
+            else {
+                ap2_ptp_shared_register(p->ptp, p->device.address);
+                ap2_ptp_engine_settle(p->ptp, 400);
+            }
         } else if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
             p->use_ptp = true;
             /* Let BMCA hear any competing Announce and resolve the grandmaster
@@ -1955,10 +1961,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_gen_uuid(peer_id);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
-        /* Advertise OUR clock as the session timeline (the engine holds
-         * grandmaster): receivers only follow masters from the timing-peer
-         * list — us — and cannot anchor to their own clock. The media anchor
-         * below is expressed against this same clock domain. */
+        /* Advertise the current shared timeline. A native HomePod group may
+         * still be in its initial sender-GM negotiation here; after stream
+         * SETUP it yields to the leader and subsequent RTP sync packets use
+         * the newly elected clock ID. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
 
         ap2_pl_node *root = ap2_pl_dict();
@@ -2231,6 +2237,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
     LOG_INFO("[AP2] Stream SETUP OK");
     free(resp);
+
+    /* A HomePod starts advertising its clock only after the RTSP session and
+     * audio stream exist. Native groups therefore settle shared BMCA here,
+     * then use the elected leader clock for SETPEERS and RTP sync packets. */
+    if (p->use_ptp && p->group_peer_count > 1)
+        ap2_ptp_engine_settle(p->ptp, 3500);
 
     /* Buffered audio: open the TCP data connection to the receiver's
      * dataPort. The socket stays blocking with a short send deadline; a
@@ -3431,6 +3443,10 @@ static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
                                      const struct ap2_ptp_exchange *ex,
                                      uint64_t now_unix_ms)
 {
+    /* In a native HomePod group the receiver leader owns the clock. Once the
+     * shared daemon has an offset lock, there is no sender-side probe streak to
+     * age: the common clock is already usable by every stream in the group. */
+    if (ap2_ptp_shared_group_clock_ready(p->ptp)) return now_unix_ms;
     uint64_t first_ms = ex->first_ms < now_unix_ms ? ex->first_ms : now_unix_ms;
     uint64_t ready = now_unix_ms - first_ms + AP2_CLOCK_LOCK_MS;
     if (p->apple_model && ex->count >= AP2_CLOCK_SEAT_EXCHANGES) {
@@ -3447,6 +3463,10 @@ static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
  * poller snapshot instead of calling this. */
 static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
 {
+    if (ap2_ptp_shared_group_clock_ready(p->ptp)) {
+        memset(ex, 0, sizeof(*ex));
+        return true;
+    }
     return ap2_ptp_peer_exchange(p->ptp, p->device.address, ex);
 }
 
@@ -4297,9 +4317,14 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
             ev->at_unix_ms = anchor_ms;
             ev->margin_ms = (int64_t)(anchor_ms - ready_ms);
             result = AP2_CLOCK_VERIFY_VERIFIED;
-            LOG_INFO("[AP2] clock verified: probe streak began %" PRIu64
-                     " ms before the anchor, readiness margin %" PRId64 " ms",
-                     ex.first_ms, ev->margin_ms);
+            if (ap2_ptp_shared_group_clock_ready(p->ptp)) {
+                LOG_INFO("[AP2] clock verified: shared HomePod leader is locked, "
+                         "readiness margin %" PRId64 " ms", ev->margin_ms);
+            } else {
+                LOG_INFO("[AP2] clock verified: probe streak began %" PRIu64
+                         " ms before the anchor, readiness margin %" PRId64 " ms",
+                         ex.first_ms, ev->margin_ms);
+            }
         } else if (!p->clock_verify_enforce) {
             /* Origin start: the shortfall is reported for lead tuning but
              * the anchor stands — the receiver self-seats a fresh session

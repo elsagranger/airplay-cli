@@ -131,6 +131,8 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
 /*
  * Control datagrams are plain text; the first non-space character selects the
  * command (arguments are space-separated):
+ *   G <leader> <ip>...   register an ordered native receiver group
+ *   V <leader> <ip>...   unregister a native receiver group
  *   R <ip> [<ip> ...]   register (add) receiver IP(s) into the timing peer set
  *   U <ip> [<ip> ...]   unregister (remove) receiver IP(s)
  *   T <ip> [<ip> ...]   nqptp-compatible alias for register (ADD; see note)
@@ -138,14 +140,15 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
  *   ? | PING            liveness probe
  *   Q <ip>              query the receiver's clock-exchange streak
  * The daemon replies to the datagram's source with a short ack, e.g.
- *   "OK peers=2 gm=0123456789abcdef role=grandmaster"
+ *   "OK peers=2 groups=2 gm=0123456789abcdef role=slave locked=1 offset_ns=42"
  * except Q, whose ack carries the streak snapshot instead (zeros = cold clock):
  *   "OK ip=10.0.0.5 count=7 first_ms=6400 last_ms=120 third_ms=4400"
  *
  * NOTE: nqptp's "T" REPLACES its peer list; ours ADDS, because each streaming
  * process registers its own receiver independently and the daemon aggregates
- * them. Use R/U for the explicit refcounted add/remove; T is only for tools
- * that speak nqptp's vocabulary.
+ * them. G/V add group lifetime plus leader ordering on top of the same peer
+ * refcounts. Use R/U for the explicit solo add/remove; T is only for tools that
+ * speak nqptp's vocabulary.
  */
 
 /* Open the daemon-side control socket (localhost UDP, bound to AP2_PTP_CTRL_PORT).

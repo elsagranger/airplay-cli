@@ -9,6 +9,7 @@
 #define __AP2_PTP_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <netinet/in.h>
 
@@ -163,6 +164,12 @@ bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx);
 bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx);
 
 /*
+ * True when this stream registered a native receiver group and the shared
+ * daemon is locked as a slave to that group's HomePod timing leader.
+ */
+bool ap2_ptp_shared_group_clock_ready(struct ap2_ptp_ctx *ctx);
+
+/*
  * Register/unregister a receiver IP with the local daemon over the control
  * channel, so the daemon aggregates it into the PTP timing peer set and runs
  * BMCA across all streams' receivers. No-op unless shared mode is active. The
@@ -170,6 +177,15 @@ bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx);
  */
 void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip);
 void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip);
+
+/*
+ * Register a receiver group with the shared daemon. The first address is the
+ * timing leader; the daemon runs Mac-style BMCA against that receiver and all
+ * streams in the group consume the resulting clock. The registration is
+ * automatically released by ap2_ptp_destroy().
+ */
+void ap2_ptp_shared_register_group(struct ap2_ptp_ctx *ctx,
+                                   const char *const *ips, size_t count);
 
 /*
  * Ask the daemon to send timing to the current peer set immediately, instead
