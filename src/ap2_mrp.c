@@ -573,9 +573,10 @@ static bool build_set_connection_state(mbuf *out, int state)
     return ok;
 }
 
-/* CLIENT_UPDATES_CONFIG_MESSAGE (ext 21): we are a sender pushing state, not a
- * controller subscribing, so everything is off — the message merely completes
- * the handshake shape controllers use. */
+/* CLIENT_UPDATES_CONFIG_MESSAGE (ext 21): this is the sender's current
+ * assumption, not a receiver-proven contract. A sender pushes state rather
+ * than subscribing, so the fields are currently all off; keep this isolated
+ * because a HomePod may use the flags when deciding which client is active. */
 static bool build_client_updates_config(mbuf *out)
 {
     bool ok = true;

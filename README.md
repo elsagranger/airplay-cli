@@ -126,14 +126,20 @@ from real device capabilities.
 
 ### Pairing
 
-- **Apple TV / HomePod (AirPlay 2, PIN)**:
+- **Apple TV / receivers that advertise full HAP pairing (AirPlay 2, PIN)**:
   `cliairplay --pair-setup <ip> --port 7000 --dacp <id>` runs full HomeKit
   pair-setup — the device shows a PIN, and on success the credentials are
   printed on stdout (`CREDENTIALS: <192 hex chars>`). Stream later with
   `--auth <creds>` and the **same `--dacp`** (the pairing identity is derived
-  from it).
+  from it). This is a generic capability; current HomePods normally use the
+  transient HAP path below and do not advertise a separate native MRP PIN
+  service.
 - **Sonos and most third-party AirPlay 2 receivers** need no pairing step: the
   native flow uses transient pairing automatically.
+- **HomePod MRP** is MediaRemote tunneled through AirPlay type 130. It reuses
+  the transient HAP session secret and does not perform a second MRP PIN
+  exchange. A native MRP PIN flow is only relevant to a receiver that advertises
+  `_mediaremotetv._tcp` with pairing enabled.
 - **Legacy Apple TV (RAOP)**: `cliairplay --pair` produces the `--secret` used
   by the RAOP flow.
 

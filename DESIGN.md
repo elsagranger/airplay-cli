@@ -610,6 +610,14 @@ them as Apple hardware. Transient-paired third-party receivers neither need nor
 receive it.
 `CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
 
+**Pairing boundary.** The HAP authentication above and MRP authentication are
+not interchangeable. A HomePod's type-130 tunnel derives its keys from the
+transient AirPlay HAP session; it does not run the native MRP SRP/PIN exchange.
+Native MRP PIN pairing belongs to a separately advertised
+`_mediaremotetv._tcp` service with `AllowPairing=YES`, which is not present on
+the HomePods used in this investigation. The full HAP `--pair-setup` code in
+this binary remains for receivers that actually expose that flow.
+
 `CLIAIRPLAY_NOW_PLAYING_PROFILE=original` is a process-wide compatibility
 profile for controlled HomePod A/B tests. It keeps the current transport,
 stereo-group, PTP, and lifecycle code, but restores the v0.5.2 default metadata
@@ -620,11 +628,14 @@ type-130/dual publication, command refresh, and leader-only filtering even if
 their individual environment toggles are enabled. Unset values and `current`
 retain the current implementation.
 
-Some HomePod software requires the legacy MediaRemote registration messages
-before Home exposes the session as controllable. Set
-`CLIAIRPLAY_MRP_TYPE130_DUAL=1` to keep the type-130 `SET_STATE` stream while
-also sending `/command` registration and now-playing updates. Leave it unset
-for receivers that close the type-130 channel on duplicate state.
+Some receiver firmware may require legacy MediaRemote registration messages
+before Home exposes a session as controllable. `CLIAIRPLAY_MRP_TYPE130_DUAL=1`
+is therefore retained as an explicit A/B switch that keeps the type-130
+`SET_STATE` stream while also sending `/command` registration and now-playing
+updates. It is **not** the default HomePod fix: the current stereo test mixed
+the sidecar context with the main RTSP owner, destabilized audio, and still did
+not create a durable Home App card. Leave it unset unless a clean, single-variable
+test proves a receiver needs it.
 
 **Transport — `POST /command`** on the main encrypted RTSP channel (same
 channel and HAP framing as `/feedback`), `Content-Type:
@@ -822,7 +833,11 @@ length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the HAP session secret) exists for *inbound*
 remote control (Siri-remote play/pause) and outbound now-playing state. The
 client opens it on an independent remote-control-only RTSP sidecar session;
-this prevents registering now-playing state from resetting the audio session.
+this is a transport-isolation choice, not proof that the receiver will associate
+the sender with the active audio client. pyatv uses a similar sidecar for
+observation, while the current HomePod sender experiment still reports
+`tvairplayd` with an empty active queue. Registration/linkage therefore remains
+an experimental result that must be verified on the receiver.
 The HAP secret input is 32 bytes for pair-verify credentials and the full
 64-byte SRP session key for transient PIN pairing. It is off by default for
 compatibility; `CLIAIRPLAY_MRP_TYPE130=1` enables it. Its value is parsed the
