@@ -24,9 +24,10 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   realtime (type 96) streaming with PTP or NTP timing, and buffered
   (type 103, RTP over TCP + `SETRATEANCHORTIME`) auto-selected on receivers
   that advertise it.
-- **Apple MediaRemote metadata**: pair-verified Apple targets receive the full
-  now-playing client, playback-state, transport-command, text and artwork
-  sequence used by current Apple senders.
+- **Apple MediaRemote metadata**: Apple targets with either pair-verified HAP or
+  an eligible transient HAP session can receive the full now-playing client,
+  playback-state, transport-command, text and artwork sequence used by current
+  Apple senders. Type-130 itself does not perform a separate PIN pairing.
 - **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
   shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
 - **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs

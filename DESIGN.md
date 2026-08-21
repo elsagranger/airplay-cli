@@ -610,6 +610,14 @@ them as Apple hardware. Transient-paired third-party receivers neither need nor
 receive it.
 `CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
 
+**PIN requirement.** Type-130 itself is not PIN-gated. Its DataStream keys come
+from the HAP secret of the enclosing AirPlay RTSP session. Apple TV commonly
+gets that secret from full HAP PIN pairing and later pair-verify; HomePod gets
+it from transient HAP pair-setup. The historical auth-credentials-only MRP gate
+was therefore an implementation policy, not a type-130 protocol rule. Enabling
+transient Apple-model sessions extended the same wire path to HomePod for an
+experiment; it did not turn HomePod into a normally PIN-paired MRP device.
+
 **Pairing boundary.** The HAP authentication above and MRP authentication are
 not interchangeable. A HomePod's type-130 tunnel derives its keys from the
 transient AirPlay HAP session; it does not run the native MRP SRP/PIN exchange.
