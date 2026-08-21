@@ -783,6 +783,7 @@ static void test_env_toggle_parsing(void)
     static const char *const on[] = { "1", "yes", "" };
 
     /* Unset keeps each toggle's own default: /command on, type-130 off. */
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
     assert(ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
@@ -804,6 +805,7 @@ static void test_env_toggle_parsing(void)
     }
     assert(unsetenv("CLIAIRPLAY_MRP") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
     puts("ap2_client env toggle parsing tests passed");
 }
 
