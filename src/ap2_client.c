@@ -453,12 +453,22 @@ static bool ap2_env_enabled(const char *name, bool unset_default)
     return true;
 }
 
+/* Preserve the current audio/group implementation while reproducing the
+ * v0.5.2 default Now Playing path. This profile is intentionally process-wide:
+ * every stream in one MA instance must publish the same metadata shape. */
+static bool ap2_original_now_playing_profile(void)
+{
+    const char *profile = getenv("CLIAIRPLAY_NOW_PLAYING_PROFILE");
+    return profile && strcmp(profile, "original") == 0;
+}
+
 /* Single answer for the opt-in type-130 channel: the setup site and the
  * [STATUS] reporter must agree, or the status line reports on a channel that
  * was never set up. */
 static bool ap2_mrp_type130_enabled(void)
 {
-    return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
+    return !ap2_original_now_playing_profile() &&
+           ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
 }
 
 /* Some HomePod software accepts type-130 state but only exposes the session
@@ -466,7 +476,20 @@ static bool ap2_mrp_type130_enabled(void)
  * /command. Keep this opt-in for receivers that accept both transports. */
 static bool ap2_mrp_type130_dual_enabled(void)
 {
-    return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130_DUAL", false);
+    return !ap2_original_now_playing_profile() &&
+           ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130_DUAL", false);
+}
+
+static bool ap2_mrp_refresh_enabled(void)
+{
+    return !ap2_original_now_playing_profile() &&
+           ap2_env_enabled("CLIAIRPLAY_MRP_REFRESH", false);
+}
+
+static bool ap2_mrp_leader_only_enabled(void)
+{
+    return !ap2_original_now_playing_profile() &&
+           ap2_env_enabled("CLIAIRPLAY_MRP_LEADER_ONLY", false);
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -3298,6 +3321,9 @@ struct ap2cl_s *ap2cl_create(
              device->name ? device->name : "unknown",
              device->address, device->port,
              p->flow == FLOW_NATIVE_AP2 ? "native AP2" : "RAOP-compat");
+    if (ap2_original_now_playing_profile())
+        LOG_INFO("[AP2] Now Playing profile: original "
+                 "(auth-only MRP, v0.5.2 DMAP, legacy progress)");
     return p;
 }
 
@@ -5106,6 +5132,58 @@ static uint8_t ap2_dmap_player_state(const struct ap2cl_s *p)
     return 1;
 }
 
+/* Reproduce the v0.5.2 native DMAP payload exactly: one mlit with mikd,
+ * title/artist/album and track number. Stereo/PTP code remains current. */
+static bool ap2_native_send_original_metadata(
+    struct ap2cl_s *p, const char *title, const char *artist, const char *album)
+{
+    if (!p || p->sock_fd < 0) return false;
+    if (!title) title = "";
+    if (!artist) artist = "";
+    if (!album) album = "";
+
+    size_t need = 8 + 9 + (8 + strlen(title)) + (8 + strlen(artist))
+                + (8 + strlen(album)) + 10;
+    uint8_t *buf = malloc(need);
+    if (!buf) return false;
+    uint8_t *q = buf;
+
+    memcpy(q, "mlit", 4); q += 8;
+    memcpy(q, "mikd", 4); q += 4;
+    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 1; *q++ = 2;
+
+    const char *tags[3] = { "minm", "asar", "asal" };
+    const char *values[3] = { title, artist, album };
+    for (int i = 0; i < 3; i++) {
+        uint32_t len = (uint32_t)strlen(values[i]);
+        memcpy(q, tags[i], 4); q += 4;
+        for (int byte = 0; byte < 4; byte++)
+            *q++ = (uint8_t)(len >> (24 - 8 * byte));
+        memcpy(q, values[i], len); q += len;
+    }
+    memcpy(q, "astn", 4); q += 4;
+    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 2; *q++ = 0; *q++ = 1;
+
+    uint32_t payload_len = (uint32_t)(q - buf - 8);
+    for (int byte = 0; byte < 4; byte++)
+        buf[4 + byte] = (uint8_t)(payload_len >> (24 - 8 * byte));
+
+    char rtpinfo[48];
+    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n",
+             p->rtp_timestamp);
+    uint8_t *resp = NULL;
+    int resp_len = 0;
+    int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
+                                  buf, (int)(q - buf),
+                                  "application/x-dmap-tagged", rtpinfo,
+                                  &resp, &resp_len);
+    LOG_INFO("[AP2] native original-profile metadata SET_PARAMETER -> "
+             "status %d (%d bytes)", status, (int)(q - buf));
+    free(resp);
+    free(buf);
+    return status >= 200 && status < 300;
+}
+
 /* Build a DMAP "mlit" metadata blob and push it over the native encrypted
  * RTSP channel. The extra queue identity and artwork flags match the fields
  * emitted by OwnTone and observed in Mac AP2 captures; some HomePod firmware
@@ -5117,6 +5195,8 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
 {
     if (!p || p->sock_fd < 0)
         return false;
+    if (ap2_original_now_playing_profile())
+        return ap2_native_send_original_metadata(p, title, artist, album);
     uint64_t persistent_id = ap2_dmap_item_id(item_id, title, artist, album);
     uint32_t item_id32 = (uint32_t)(persistent_id ^ (persistent_id >> 32));
     if (!item_id32)
@@ -5187,10 +5267,11 @@ static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
 
 static bool ap2_mrp_session_eligible(const struct ap2cl_s *p)
 {
-    return p && p->flow == FLOW_NATIVE_AP2 &&
-           (p->auth_credentials || p->apple_model) &&
-           (!ap2_env_enabled("CLIAIRPLAY_MRP_LEADER_ONLY", false) ||
-            p->group_peer_count < 2 ||
+    if (!p || p->flow != FLOW_NATIVE_AP2) return false;
+    if (ap2_original_now_playing_profile())
+        return p->auth_credentials != NULL;
+    return (p->auth_credentials || p->apple_model) &&
+           (!ap2_mrp_leader_only_enabled() || p->group_peer_count < 2 ||
             (p->group_peers && p->group_peers[0] && p->device.address &&
              strcmp(p->device.address, p->group_peers[0]) == 0));
 }
@@ -5455,7 +5536,7 @@ static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p)
 {
     enum { MRP_FULL_REFRESH_MS = 15000 };
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0 ||
-        !ap2_env_enabled("CLIAIRPLAY_MRP_REFRESH", false) ||
+        !ap2_mrp_refresh_enabled() ||
         ap2_mrp_type130_enabled() ||
         p->state != AP2_STREAMING || p->content_paused ||
         p->content_stopped)
@@ -5644,9 +5725,11 @@ bool ap2cl_set_metadata_ex_url(struct ap2cl_s *p, const char *title,
     bool have_mrp = p->mrp != NULL;
     bool channel_active = ap2_mrp_channel_active(p);
     bool track_changed = false;
+    const char *effective_artwork_url =
+        ap2_original_now_playing_profile() ? NULL : artwork_url;
     if (p->mrp)
         ap2_mrp_set_track_url(p->mrp, title, artist, album, duration * 1000,
-                              item_id, artwork_url, content_type, art_data,
+                              item_id, effective_artwork_url, content_type, art_data,
                               art_len, &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
     if (track_changed_out) *track_changed_out = track_changed;
@@ -6139,9 +6222,24 @@ bool ap2cl_test_env_enabled(const char *name, bool unset_default)
     return ap2_env_enabled(name, unset_default);
 }
 
+bool ap2cl_test_original_now_playing_profile(void)
+{
+    return ap2_original_now_playing_profile();
+}
+
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_mrp_refresh_enabled(void)
+{
+    return ap2_mrp_refresh_enabled();
+}
+
+bool ap2cl_test_mrp_leader_only_enabled(void)
+{
+    return ap2_mrp_leader_only_enabled();
 }
 
 bool ap2cl_test_mrp_dmap_enabled(bool channel_active)

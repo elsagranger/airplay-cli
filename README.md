@@ -305,6 +305,13 @@ start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
+Set `CLIAIRPLAY_NOW_PLAYING_PROFILE=original` to retain the current audio,
+stereo-group, PTP, and lifecycle implementation while reproducing the v0.5.2
+default Now Playing path: MRP is auth-credentials-only, native DMAP uses the
+original `mikd`/title/artist/album/track-number payload, progress uses the
+legacy `SET_PARAMETER` path when MRP is absent, and the later artwork-URL,
+type-130, dual, refresh, and leader-only experiments are disabled. The default
+profile remains the current implementation.
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,

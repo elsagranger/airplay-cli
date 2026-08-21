@@ -57,7 +57,10 @@ bool ap2cl_test_mrp_group_publisher(const char *device_address,
                                     const char *leader_address,
                                     size_t peer_count);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
+bool ap2cl_test_original_now_playing_profile(void);
 bool ap2cl_test_mrp_type130_enabled(void);
+bool ap2cl_test_mrp_refresh_enabled(void);
+bool ap2cl_test_mrp_leader_only_enabled(void);
 bool ap2cl_test_mrp_dmap_enabled(bool channel_active);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
@@ -804,6 +807,33 @@ static void test_env_toggle_parsing(void)
     puts("ap2_client env toggle parsing tests passed");
 }
 
+static void test_original_now_playing_profile_toggles(void)
+{
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    assert(!ap2cl_test_original_now_playing_profile());
+
+    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP_TYPE130", "1", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP_REFRESH", "1", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP_LEADER_ONLY", "1", 1) == 0);
+    assert(ap2cl_test_original_now_playing_profile());
+    assert(!ap2cl_test_mrp_type130_enabled());
+    assert(!ap2cl_test_mrp_refresh_enabled());
+    assert(!ap2cl_test_mrp_leader_only_enabled());
+
+    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "current", 1) == 0);
+    assert(!ap2cl_test_original_now_playing_profile());
+    assert(ap2cl_test_mrp_type130_enabled());
+    assert(ap2cl_test_mrp_refresh_enabled());
+    assert(ap2cl_test_mrp_leader_only_enabled());
+
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_REFRESH") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_LEADER_ONLY") == 0);
+    puts("ap2_client original Now Playing profile toggle tests passed");
+}
+
 static void test_mrp_type130_dual_keeps_dmap(void)
 {
     assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
@@ -1362,6 +1392,69 @@ static bool request_has(const command_peer_request_t *req, const char *needle)
     return bytes_contain_string(req->body, (size_t)req->body_len, needle);
 }
 
+static void test_original_now_playing_profile_dmap(void)
+{
+    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP", "0", 1) == 0);
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 1;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "original profile test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    assert(ap2cl_set_metadata_ex_url(
+        client, "Track", "Artist", "Album", 180, "item-1",
+        "http://127.0.0.1/artwork.jpg", NULL, NULL, 0,
+        NULL, NULL, NULL));
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok && peer->request_count == 1);
+    assert(strcmp(peer->requests[0].method, "SET_PARAMETER") == 0);
+    assert(request_has(&peer->requests[0], "mlit"));
+    assert(request_has(&peer->requests[0], "mikd"));
+    assert(request_has(&peer->requests[0], "minm"));
+    assert(request_has(&peer->requests[0], "asar"));
+    assert(request_has(&peer->requests[0], "asal"));
+    assert(request_has(&peer->requests[0], "astn"));
+    assert(!request_has(&peer->requests[0], "miid"));
+    assert(!request_has(&peer->requests[0], "mper"));
+    assert(!request_has(&peer->requests[0], "mcti"));
+    assert(!request_has(&peer->requests[0], "asdk"));
+    assert(!request_has(&peer->requests[0], "astm"));
+    assert(!request_has(&peer->requests[0], "ased"));
+    assert(!request_has(&peer->requests[0], "asac"));
+    assert(!request_has(&peer->requests[0], "caps"));
+    assert(!request_has(&peer->requests[0], "artwork.jpg"));
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    puts("ap2_client original Now Playing DMAP profile tests passed");
+}
+
 /* MediaRemote publication over a scripted RTSP peer: the track bundle reaches
  * the receiver as ONE now-playing replace push carrying the artwork; pause
  * and resume each push a timeline (mergePolicy update) body BEFORE their
@@ -1757,15 +1850,24 @@ static void test_apple_model_resolution(void)
 
 static void test_mrp_session_eligibility(void)
 {
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
     assert(ap2cl_test_mrp_session_eligible(true, true, false));
     assert(ap2cl_test_mrp_session_eligible(true, false, true));
     assert(!ap2cl_test_mrp_session_eligible(true, false, false));
     assert(!ap2cl_test_mrp_session_eligible(false, true, true));
+
+    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
+    assert(ap2cl_test_mrp_session_eligible(true, true, false));
+    assert(!ap2cl_test_mrp_session_eligible(true, false, true));
+    assert(!ap2cl_test_mrp_session_eligible(true, false, false));
+    assert(!ap2cl_test_mrp_session_eligible(false, true, true));
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
     puts("ap2_client MRP session eligibility tests passed");
 }
 
 static void test_mrp_group_leader_only(void)
 {
+    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
     assert(setenv("CLIAIRPLAY_MRP_LEADER_ONLY", "1", 1) == 0);
     assert(ap2cl_test_mrp_group_publisher("192.0.2.1", "192.0.2.1", 2));
     assert(!ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 2));
@@ -2373,6 +2475,7 @@ int main(void)
     test_native_group_setpeers_uri();
     test_native_realtime_dscp_ef();
     test_env_toggle_parsing();
+    test_original_now_playing_profile_toggles();
     test_mrp_type130_dual_keeps_dmap();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
@@ -2380,6 +2483,7 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
+    test_original_now_playing_profile_dmap();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();

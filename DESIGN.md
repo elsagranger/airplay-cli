@@ -610,6 +610,16 @@ them as Apple hardware. Transient-paired third-party receivers neither need nor
 receive it.
 `CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
 
+`CLIAIRPLAY_NOW_PLAYING_PROFILE=original` is a process-wide compatibility
+profile for controlled HomePod A/B tests. It keeps the current transport,
+stereo-group, PTP, and lifecycle code, but restores the v0.5.2 default metadata
+boundary: only sessions with stored auth credentials are eligible for MRP,
+native DMAP uses the original small payload, and progress falls back to legacy
+`SET_PARAMETER` when MRP is absent. The profile also suppresses artwork URL,
+type-130/dual publication, command refresh, and leader-only filtering even if
+their individual environment toggles are enabled. Unset values and `current`
+retain the current implementation.
+
 Some HomePod software requires the legacy MediaRemote registration messages
 before Home exposes the session as controllable. Set
 `CLIAIRPLAY_MRP_TYPE130_DUAL=1` to keep the type-130 `SET_STATE` stream while
