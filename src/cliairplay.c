@@ -620,6 +620,7 @@ static struct {
     char *artist;
     char *album;
     char *item_id;  /* sender's stable per-track identity (ITEMID key) */
+    char *artwork_url; /* receiver-reachable source URL (ARTWORKURL key) */
     char *artwork_file; /* staged path (ARTWORKFILE key); SENDMETA consumes it */
     int duration;
     int progress;
@@ -691,13 +692,12 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
         ap2_mrp_artwork_info_t mrp_info;
         ap2_mrp_push_result_t push;
         bool track_changed = false;
-        ap2cl_set_metadata_ex(g_ap2cl, title, metadata_str(g_metadata.artist),
-                              metadata_str(g_metadata.album),
-                              g_metadata.duration,
-                              metadata_str(g_metadata.item_id),
-                              image ? content_type : NULL, image,
-                              (int)image_size, &track_changed, &mrp_info,
-                              &push);
+        ap2cl_set_metadata_ex_url(
+            g_ap2cl, title, metadata_str(g_metadata.artist),
+            metadata_str(g_metadata.album), g_metadata.duration,
+            metadata_str(g_metadata.item_id), metadata_str(g_metadata.artwork_url),
+            image ? content_type : NULL, image, (int)image_size,
+            &track_changed, &mrp_info, &push);
         if (artwork_failed && track_changed && push.overall_status >= 0) {
             /* The track changed, so the retained art was dropped and the
              * bundle push above already went out without artwork: no
@@ -767,6 +767,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         metadata_set(&g_metadata.album, value);
     } else if (strcmp(key, "ITEMID") == 0) {
         metadata_set(&g_metadata.item_id, value);
+    } else if (strcmp(key, "ARTWORKURL") == 0) {
+        metadata_set(&g_metadata.artwork_url, value);
     } else if (strcmp(key, "ARTWORKFILE") == 0) {
         /* Stage-only, like TITLE: the next SENDMETA loads the file and pushes
          * it bundled with the metadata. An empty value clears the staging. */
@@ -2449,7 +2451,9 @@ int main(int argc, char *argv[])
     free(g_metadata.title);
     free(g_metadata.artist);
     free(g_metadata.album);
+    free(g_metadata.artwork_url);
     g_metadata.title = g_metadata.artist = g_metadata.album = NULL;
+    g_metadata.artwork_url = NULL;
     free(g_pend_announce_file);
     g_pend_announce_file = NULL;
     netsock_close();

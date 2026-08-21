@@ -95,7 +95,6 @@ enum mrp_msg_type {
     MRP_MSG_WAKE_DEVICE             = 41,
     MRP_MSG_GENERIC                 = 42,
     MRP_MSG_SET_NOW_PLAYING_CLIENT  = 46,
-    MRP_MSG_SET_NOW_PLAYING_PLAYER  = 47,
     MRP_MSG_UPDATE_CLIENT           = 55,
     MRP_MSG_UPDATE_CONTENT_ITEM     = 56,
     MRP_MSG_REMOVE_CLIENT           = 53,
@@ -209,6 +208,9 @@ struct ap2_mrp_ctx {
     char *artwork_mime;
     uint8_t *artwork;
     int artwork_len;
+    uint32_t artwork_width;
+    uint32_t artwork_height;
+    char *artwork_url;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
     char *item_id;            /* sender's stable per-track identity ("" = none) */
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
@@ -332,6 +334,10 @@ static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
     m->artwork_len = 0;
     free(m->artwork_mime);
     m->artwork_mime = NULL;
+    free(m->artwork_url);
+    m->artwork_url = NULL;
+    m->artwork_width = 0;
+    m->artwork_height = 0;
     m->artwork_id[0] = '\0';
 }
 
@@ -621,11 +627,17 @@ static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
     ok &= pb_put_string_field(meta, 7, m->artist ? m->artist : "");   /* trackArtistName */
     if (m->duration_ms > 0)
         ok &= pb_put_double_field(meta, 14, dur_s);                   /* duration */
-    ok &= pb_put_bool_field(meta, 19, m->artwork_len > 0);            /* artworkAvailable */
+    ok &= pb_put_bool_field(meta, 19,
+                            m->artwork_len > 0 ||
+                            (m->artwork_url && *m->artwork_url));       /* artworkAvailable */
     ok &= pb_put_bool_field(meta, 27,
                             m->playback_state != AP2_MRP_PLAYBACK_STOPPED);
     if (m->artwork_mime && m->artwork_len > 0)
         ok &= pb_put_string_field(meta, 31, m->artwork_mime);         /* artworkMIMEType */
+    else if (m->artwork_url && *m->artwork_url)
+        ok &= pb_put_string_field(meta, 31, "image/jpeg");            /* artworkMIMEType */
+    if (m->item_id && *m->item_id)
+        ok &= pb_put_string_field(meta, 44, m->item_id);              /* contentIdentifier */
     ok &= pb_put_double_field(meta, 35, elapsed_s);                   /* elapsedTime */
     ok &= pb_put_float_field(meta, 39,
                              m->playback_state == AP2_MRP_PLAYBACK_PLAYING
@@ -633,6 +645,12 @@ static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
     ok &= pb_put_varint_field(meta, 64, MRP_MEDIA_TYPE_AUDIO);        /* mediaType */
     ok &= pb_put_varint_field(meta, 65, MRP_MEDIA_SUBTYPE_MUSIC);     /* mediaSubType */
     ok &= pb_put_double_field(meta, 74, m->elapsed_set_at);           /* elapsedTimeTimestamp */
+    if (m->artwork_url && *m->artwork_url)
+        ok &= pb_put_string_field(meta, 70, m->artwork_url);           /* artworkURL */
+    if (m->artwork_width > 0)
+        ok &= pb_put_varint_field(meta, 77, m->artwork_width);         /* artworkDataWidth */
+    if (m->artwork_height > 0)
+        ok &= pb_put_varint_field(meta, 78, m->artwork_height);        /* artworkDataHeight */
     return ok;
 }
 
@@ -665,7 +683,8 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
                             mbuf *out)
 {
     bool ok = true;
-    mbuf npi = {0}, meta = {0}, item = {0}, queue = {0}, sc = {0}, inner = {0};
+    mbuf npi = {0}, meta = {0}, item = {0}, queue = {0}, sc = {0};
+    mbuf inner = {0};
     double now_cf = mrp_cf_now();
 
     /* NowPlayingInfo (field numbers from NowPlayingInfo.proto) */
@@ -679,15 +698,25 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
                                  ? 1.0f : 0.0f);                       /* playbackRate */
     ok &= pb_put_double_field(&npi, 8, now_cf);                       /* timestamp */
     ok &= pb_put_string_field(&npi, 9, m->title ? m->title : "");     /* title */
+    ok &= pb_put_varint_field(&npi, 10, m->np_uid);                    /* uniqueIdentifier */
     ok &= pb_put_bool_field(&npi, 12, true);                          /* isMusicApp */
 
     /* PlaybackQueue { location=1, contentItems=2 } with one ContentItem */
     ok = ok && build_content_item_metadata(m, &meta);
-    ok &= pb_put_string_field(&item, 1, m->dacp_id);                  /* identifier */
+    /* The queue item identity must be stable per track, not shared with the
+     * sender identity. Fall back to the sender ID only for metadata-less
+     * callers that do not provide an item ID. */
+    const char *content_identifier =
+        m->item_id && *m->item_id ? m->item_id : m->dacp_id;
+    ok &= pb_put_string_field(&item, 1, content_identifier);          /* identifier */
     ok = ok && pb_put_msg_field(&item, 2, &meta);                     /* metadata */
     if (include_artwork && m->artwork && m->artwork_len > 0)
         ok &= pb_put_bytes_field(&item, 3, m->artwork,
                                  (size_t)m->artwork_len);             /* artworkData */
+    if (m->artwork_width > 0)
+        ok &= pb_put_varint_field(&item, 13, m->artwork_width);        /* artworkDataWidth */
+    if (m->artwork_height > 0)
+        ok &= pb_put_varint_field(&item, 14, m->artwork_height);       /* artworkDataHeight */
     ok &= pb_put_varint_field(&queue, 1, 0);                          /* location */
     ok = ok && pb_put_msg_field(&queue, 2, &item);                    /* contentItems */
 
@@ -1472,6 +1501,7 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->item_id);
     free(m->artwork_mime);
     free(m->artwork);
+    free(m->artwork_url);
     free(m);
 }
 
@@ -1551,8 +1581,8 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     LOG_INFO("[MRP] data channel connected to %s:%d", m->host, data_port);
 
     /* Opening sequence: DEVICE_INFO must be first (receiver stays silent
-     * otherwise), then connection state, updates config, now-playing client
-     * registration, and the initial full state. */
+     * otherwise), then connection state, updates config, now-playing client,
+     * followed by the initial full state. */
     bool ok = true;
     mbuf msg = {0};
     ok = ok && build_device_info(m, &msg) && mrp_send_protobuf(m, &msg);
@@ -1612,11 +1642,12 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
     m->event_plain_len = 0;
 }
 
-bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
-                       const char *artist, const char *album,
-                       int duration_ms, const char *item_id,
-                       const char *mime, const uint8_t *art, int art_len,
-                       bool *track_changed_out, ap2_mrp_artwork_info_t *info)
+bool ap2_mrp_set_track_url(struct ap2_mrp_ctx *m, const char *title,
+                           const char *artist, const char *album,
+                           int duration_ms, const char *item_id,
+                           const char *artwork_url, const char *mime,
+                           const uint8_t *art, int art_len,
+                           bool *track_changed_out, ap2_mrp_artwork_info_t *info)
 {
     ap2_mrp_artwork_info_t local_info;
     if (!info) info = &local_info;
@@ -1679,10 +1710,27 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
          * item without a new image keeps what it has (tag refinement). */
         if (track_changed) mrp_reset_artwork(m);
     }
+    /* Keep the source URL even when the embedded image failed validation: a
+     * receiver can still resolve the direct artwork URL independently. */
+    if (artwork_url && *artwork_url)
+        mrp_replace_str(&m->artwork_url, artwork_url);
+    else if (track_changed)
+        mrp_replace_str(&m->artwork_url, NULL);
     m->state_generation++;
     m->state_dirty = true;
     if (track_changed_out) *track_changed_out = track_changed;
     return true;
+}
+
+bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
+                       const char *artist, const char *album,
+                       int duration_ms, const char *item_id,
+                       const char *mime, const uint8_t *art, int art_len,
+                       bool *track_changed_out, ap2_mrp_artwork_info_t *info)
+{
+    return ap2_mrp_set_track_url(m, title, artist, album, duration_ms, item_id,
+                                 NULL, mime, art, art_len,
+                                 track_changed_out, info);
 }
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -1742,6 +1790,8 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     free(m->artwork);
     m->artwork = copy;
     m->artwork_len = len;
+    m->artwork_width = info->width;
+    m->artwork_height = info->height;
     free(m->artwork_mime);
     m->artwork_mime = mime_copy;
     /* Fresh artwork: new ArtworkIdentifier for the new pixels. The bytes ride

@@ -53,8 +53,12 @@ void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_mrp_session_eligible(bool native, bool authenticated, bool apple);
+bool ap2cl_test_mrp_group_publisher(const char *device_address,
+                                    const char *leader_address,
+                                    size_t peer_count);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
 bool ap2cl_test_mrp_type130_enabled(void);
+bool ap2cl_test_mrp_dmap_enabled(bool channel_active);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
 void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p);
@@ -800,6 +804,20 @@ static void test_env_toggle_parsing(void)
     puts("ap2_client env toggle parsing tests passed");
 }
 
+static void test_mrp_type130_dual_keeps_dmap(void)
+{
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
+    assert(ap2cl_test_mrp_dmap_enabled(false));
+    assert(!ap2cl_test_mrp_dmap_enabled(true));
+
+    assert(setenv("CLIAIRPLAY_MRP_TYPE130_DUAL", "1", 1) == 0);
+    assert(ap2cl_test_mrp_dmap_enabled(false));
+    assert(ap2cl_test_mrp_dmap_enabled(true));
+
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
+    puts("ap2_client MRP type-130 dual DMAP tests passed");
+}
+
 /* The splice timeline is the default for every native session; the deny-list
  * (classic flush + re-anchor fallback) ships empty. The 2026-07-31 fleet A/B
  * cleared the third-party park on the splice mechanism — adding a deny entry
@@ -1451,6 +1469,14 @@ static void test_mrp_bundle_and_pause_publish(void)
     /* Bundle 1: DMAP metadata + artwork ride SET_PARAMETER first. */
     assert(strcmp(peer->requests[0].method, "SET_PARAMETER") == 0);
     assert(request_has(&peer->requests[0], "mlit"));
+    assert(request_has(&peer->requests[0], "miid"));
+    assert(request_has(&peer->requests[0], "mper"));
+    assert(request_has(&peer->requests[0], "mcti"));
+    assert(request_has(&peer->requests[0], "asdk"));
+    assert(request_has(&peer->requests[0], "astm"));
+    assert(request_has(&peer->requests[0], "ased"));
+    assert(request_has(&peer->requests[0], "asac"));
+    assert(request_has(&peer->requests[0], "caps"));
     assert(strcmp(peer->requests[1].method, "SET_PARAMETER") == 0);
     assert(bytes_contain(peer->requests[1].body,
                          (size_t)peer->requests[1].body_len,
@@ -1736,6 +1762,17 @@ static void test_mrp_session_eligibility(void)
     assert(!ap2cl_test_mrp_session_eligible(true, false, false));
     assert(!ap2cl_test_mrp_session_eligible(false, true, true));
     puts("ap2_client MRP session eligibility tests passed");
+}
+
+static void test_mrp_group_leader_only(void)
+{
+    assert(setenv("CLIAIRPLAY_MRP_LEADER_ONLY", "1", 1) == 0);
+    assert(ap2cl_test_mrp_group_publisher("192.0.2.1", "192.0.2.1", 2));
+    assert(!ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 2));
+    assert(ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 1));
+    assert(unsetenv("CLIAIRPLAY_MRP_LEADER_ONLY") == 0);
+    assert(ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 2));
+    puts("ap2_client MRP group leader-only tests passed");
 }
 
 /* The pacing window is a duration, so every term scales with the stream rate:
@@ -2336,6 +2373,7 @@ int main(void)
     test_native_group_setpeers_uri();
     test_native_realtime_dscp_ef();
     test_env_toggle_parsing();
+    test_mrp_type130_dual_keeps_dmap();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
@@ -2346,6 +2384,7 @@ int main(void)
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
     test_mrp_session_eligibility();
+    test_mrp_group_leader_only();
     test_pacing_window_rate_scaling();
     test_splice_depth_override_vs_reported_buffer();
     test_splice_depth_bounds();

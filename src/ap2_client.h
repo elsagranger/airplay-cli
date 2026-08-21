@@ -412,6 +412,17 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            ap2_mrp_artwork_info_t *mrp_info,
                            ap2_mrp_push_result_t *mrp_push);
 
+/* Extended metadata setter carrying a receiver-reachable artwork URL. */
+bool ap2cl_set_metadata_ex_url(struct ap2cl_s *p, const char *title,
+                               const char *artist, const char *album,
+                               int duration, const char *item_id,
+                               const char *artwork_url,
+                               const char *content_type,
+                               const uint8_t *art_data, int art_len,
+                               bool *track_changed_out,
+                               ap2_mrp_artwork_info_t *mrp_info,
+                               ap2_mrp_push_result_t *mrp_push);
+
 /* ap2cl_set_metadata_ex without artwork or result reporting. */
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration, const char *item_id);

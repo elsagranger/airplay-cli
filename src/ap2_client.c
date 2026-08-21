@@ -260,6 +260,7 @@ struct ap2cl_s {
     bool mrp_extended_registered;
     bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
                                      timeline pushes use the full replace */
+    uint64_t mrp_last_full_refresh_ms;
     int mrp_last_playback_state;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
@@ -421,6 +422,7 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      bool force);
 static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
     struct ap2cl_s *p);
+static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
@@ -4935,6 +4937,7 @@ bool ap2cl_feedback(struct ap2cl_s *p)
                 LOG_SDEBUG("[MRP] state push deferred behind publication");
             }
         }
+        ap2cl_mrp_refresh_if_due(p);
     }
     if (result == AP2_FEEDBACK_SUCCEEDED) {
         unsigned prior_misses = atomic_exchange(&p->feedback_failures, 0);
@@ -4991,55 +4994,181 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
     return false;
 }
 
-/* Build a DMAP "mlit" metadata blob (libraop's rtspcl_set_daap wire format) and
- * push it over the native encrypted RTSP channel. Sonos withholds audio until it
- * receives track metadata, so the native flow must send this to become audible
- * (the RAOP-compat flow gets it for free via raopcl). */
-static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
-                                     const char *artist, const char *album)
+typedef struct {
+    uint8_t *data;
+    size_t len;
+    size_t capacity;
+} ap2_dmap_builder_t;
+
+static bool ap2_dmap_reserve(ap2_dmap_builder_t *builder, size_t extra)
 {
-    if (!p || p->sock_fd < 0) return false;
-    if (!title)  title  = "";
-    if (!artist) artist = "";
-    if (!album)  album  = "";
+    if (!builder || extra > SIZE_MAX - builder->len)
+        return false;
+    size_t required = builder->len + extra;
+    if (required <= builder->capacity)
+        return true;
 
-    size_t need = 8 + 9 + (8 + strlen(title)) + (8 + strlen(artist))
-                + (8 + strlen(album)) + 10;
-    uint8_t *buf = malloc(need);
-    if (!buf) return false;
-    uint8_t *q = buf;
-
-    memcpy(q, "mlit", 4); q += 8;                        /* size backfilled below */
-    memcpy(q, "mikd", 4); q += 4;
-    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 1; *q++ = 2;    /* mikd: len 1, value 2 */
-
-    const char *tags[3] = { "minm", "asar", "asal" };
-    const char *vals[3] = { title, artist, album };
-    for (int i = 0; i < 3; i++) {
-        uint32_t n = (uint32_t)strlen(vals[i]);
-        memcpy(q, tags[i], 4); q += 4;
-        for (int b = 0; b < 4; b++) *q++ = (n >> (24 - 8 * b)) & 0xff;
-        memcpy(q, vals[i], n); q += n;
+    size_t capacity = builder->capacity ? builder->capacity : 128;
+    while (capacity < required) {
+        if (capacity > SIZE_MAX / 2) {
+            capacity = required;
+            break;
+        }
+        capacity *= 2;
     }
-    memcpy(q, "astn", 4); q += 4;                        /* track number = 1 (int16) */
-    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 2; *q++ = 0; *q++ = 1;
+    uint8_t *data = realloc(builder->data, capacity);
+    if (!data)
+        return false;
+    builder->data = data;
+    builder->capacity = capacity;
+    return true;
+}
 
-    uint32_t sz = (uint32_t)(q - buf - 8);               /* mlit payload size */
-    for (int b = 0; b < 4; b++) buf[4 + b] = (sz >> (24 - 8 * b)) & 0xff;
+static bool ap2_dmap_append(ap2_dmap_builder_t *builder, const void *data,
+                            size_t len)
+{
+    if (!ap2_dmap_reserve(builder, len))
+        return false;
+    if (len)
+        memcpy(builder->data + builder->len, data, len);
+    builder->len += len;
+    return true;
+}
+
+static bool ap2_dmap_append_field(ap2_dmap_builder_t *builder, const char *tag,
+                                  const void *value, uint32_t value_len)
+{
+    uint8_t header[8];
+    if (!tag || strlen(tag) != 4)
+        return false;
+    memcpy(header, tag, 4);
+    header[4] = (uint8_t)(value_len >> 24);
+    header[5] = (uint8_t)(value_len >> 16);
+    header[6] = (uint8_t)(value_len >> 8);
+    header[7] = (uint8_t)value_len;
+    return ap2_dmap_append(builder, header, sizeof(header)) &&
+           ap2_dmap_append(builder, value, value_len);
+}
+
+static bool ap2_dmap_append_uint(ap2_dmap_builder_t *builder, const char *tag,
+                                 uint64_t value, uint32_t width)
+{
+    uint8_t encoded[8];
+    if (width == 0 || width > sizeof(encoded))
+        return false;
+    for (uint32_t i = 0; i < width; i++)
+        encoded[i] = (uint8_t)(value >> (8 * (width - i - 1)));
+    return ap2_dmap_append_field(builder, tag, encoded, width);
+}
+
+static bool ap2_dmap_append_string(ap2_dmap_builder_t *builder, const char *tag,
+                                   const char *value)
+{
+    if (!value)
+        value = "";
+    size_t len = strlen(value);
+    if (len > UINT32_MAX)
+        return false;
+    return ap2_dmap_append_field(builder, tag, value, (uint32_t)len);
+}
+
+static void ap2_dmap_hash_bytes(uint64_t *hash, const void *data, size_t len)
+{
+    const uint8_t *bytes = data;
+    for (size_t i = 0; i < len; i++) {
+        *hash ^= bytes[i];
+        *hash *= UINT64_C(1099511628211);
+    }
+}
+
+/* DMAP persistent IDs are numeric even when the caller's queue ID is a URI. */
+static uint64_t ap2_dmap_item_id(const char *item_id, const char *title,
+                                 const char *artist, const char *album)
+{
+    uint64_t hash = UINT64_C(1469598103934665603);
+    const char *values[4] = { item_id, title, artist, album };
+    int first = item_id && *item_id ? 0 : 1;
+    for (int i = first; i < 4; i++) {
+        const char *value = values[i] ? values[i] : "";
+        ap2_dmap_hash_bytes(&hash, value, strlen(value));
+        ap2_dmap_hash_bytes(&hash, "\xff", 1);
+    }
+    return hash ? hash : 1;
+}
+
+static uint8_t ap2_dmap_player_state(const struct ap2cl_s *p)
+{
+    /* DXXP's caps values are Undefined=0, Playing=1, Paused=2, Stopped=3. */
+    if (!p || p->content_stopped || p->state == AP2_DOWN)
+        return 3;
+    if (p->state == AP2_PAUSED || p->content_paused)
+        return 2;
+    return 1;
+}
+
+/* Build a DMAP "mlit" metadata blob and push it over the native encrypted
+ * RTSP channel. The extra queue identity and artwork flags match the fields
+ * emitted by OwnTone and observed in Mac AP2 captures; some HomePod firmware
+ * ignores a raw image unless these fields are present in the same item. */
+static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
+                                     const char *artist, const char *album,
+                                     int duration, const char *item_id,
+                                     bool artwork_available)
+{
+    if (!p || p->sock_fd < 0)
+        return false;
+    uint64_t persistent_id = ap2_dmap_item_id(item_id, title, artist, album);
+    uint32_t item_id32 = (uint32_t)(persistent_id ^ (persistent_id >> 32));
+    if (!item_id32)
+        item_id32 = 1;
+    uint32_t duration_ms = duration > 0 &&
+                                   (uint64_t)duration <= UINT32_MAX / 1000
+                               ? (uint32_t)duration * 1000
+                               : 0;
+    ap2_dmap_builder_t builder = {0};
+    bool ok = ap2_dmap_append(&builder, "mlit\0\0\0\0", 8);
+    ok = ok && ap2_dmap_append_uint(&builder, "mikd", 2, 1);
+    ok = ok && ap2_dmap_append_uint(&builder, "asdk", 0, 1);
+    ok = ok && ap2_dmap_append_uint(&builder, "miid", item_id32, 4);
+    ok = ok && ap2_dmap_append_string(&builder, "minm", title);
+    ok = ok && ap2_dmap_append_uint(&builder, "mper", persistent_id, 8);
+    ok = ok && ap2_dmap_append_uint(&builder, "mcti", item_id32, 4);
+    ok = ok && ap2_dmap_append_string(&builder, "asal", album);
+    ok = ok && ap2_dmap_append_string(&builder, "asar", artist);
+    ok = ok && ap2_dmap_append_uint(&builder, "astm", duration_ms, 4);
+    ok = ok && ap2_dmap_append_uint(&builder, "astn", 1, 2);
+    if (artwork_available) {
+        ok = ok && ap2_dmap_append_uint(&builder, "ased", 1, 2);
+        ok = ok && ap2_dmap_append_uint(&builder, "asac", 1, 2);
+    }
+    ok = ok && ap2_dmap_append_uint(&builder, "caps",
+                                    ap2_dmap_player_state(p), 1);
+    if (!ok || builder.len < 8 || builder.len - 8 > UINT32_MAX) {
+        free(builder.data);
+        return false;
+    }
+    uint32_t payload_len = (uint32_t)(builder.len - 8);
+    builder.data[4] = (uint8_t)(payload_len >> 24);
+    builder.data[5] = (uint8_t)(payload_len >> 16);
+    builder.data[6] = (uint8_t)(payload_len >> 8);
+    builder.data[7] = (uint8_t)payload_len;
 
     /* Anchor the metadata to the current RTP position; the RAOP-compat path
      * sends this via RTP-Info and Sonos 400s a metadata request without it. */
     char rtpinfo[48];
-    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n",
+             p->rtp_timestamp);
 
-    uint8_t *resp = NULL; int resp_len = 0;
+    uint8_t *resp = NULL;
+    int resp_len = 0;
     int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
-                            buf, (int)(q - buf), "application/x-dmap-tagged",
-                            rtpinfo, &resp, &resp_len);
+                                  builder.data, (int)builder.len,
+                                  "application/x-dmap-tagged", rtpinfo,
+                                  &resp, &resp_len);
     LOG_INFO("[AP2] native metadata SET_PARAMETER -> status %d (%d bytes)",
-             status, (int)(q - buf));
+             status, (int)builder.len);
     free(resp);
-    free(buf);
+    free(builder.data);
     return status >= 200 && status < 300;
 }
 
@@ -5059,7 +5188,11 @@ static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
 static bool ap2_mrp_session_eligible(const struct ap2cl_s *p)
 {
     return p && p->flow == FLOW_NATIVE_AP2 &&
-           (p->auth_credentials || p->apple_model);
+           (p->auth_credentials || p->apple_model) &&
+           (!ap2_env_enabled("CLIAIRPLAY_MRP_LEADER_ONLY", false) ||
+            p->group_peer_count < 2 ||
+            (p->group_peers && p->group_peers[0] && p->device.address &&
+             strcmp(p->device.address, p->group_peers[0]) == 0));
 }
 
 /* Lazily create MediaRemote for pair-verified native sessions and transient
@@ -5158,6 +5291,11 @@ static bool ap2_mrp_channel_active(struct ap2cl_s *p)
 {
     return p && ap2_mrp_type130_enabled() && p->mrp &&
            ap2_mrp_is_connected(p->mrp);
+}
+
+static bool ap2_mrp_should_send_dmap(bool channel_active)
+{
+    return !channel_active || ap2_mrp_type130_dual_enabled();
 }
 
 /* The feedback worker owns type-130 writes. Callers only mark the MRP state
@@ -5309,6 +5447,52 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
     return ap2cl_mrp_push_serialized_with(p, ap2_mrp_build_nowplaying_command);
 }
 
+/* Reassert the complete sender registration on the main audio session. This
+ * is deliberately opt-in: it tests whether Home App drops an otherwise valid
+ * sender after the initial push, without opening the known-unstable type-130
+ * sidecar or mixing session identities. */
+static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p)
+{
+    enum { MRP_FULL_REFRESH_MS = 15000 };
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0 ||
+        !ap2_env_enabled("CLIAIRPLAY_MRP_REFRESH", false) ||
+        ap2_mrp_type130_enabled() ||
+        p->state != AP2_STREAMING || p->content_paused ||
+        p->content_stopped)
+        return;
+
+    uint64_t now = ap2_io_monotonic_ms();
+    if (p->mrp_last_full_refresh_ms == 0) {
+        p->mrp_last_full_refresh_ms = now;
+        return;
+    }
+    if (now - p->mrp_last_full_refresh_ms < MRP_FULL_REFRESH_MS)
+        return;
+    if (pthread_mutex_trylock(&p->mrp_publish_lock) != 0)
+        return;
+
+    pthread_mutex_lock(&p->mrp_lock);
+    /* Command-only MRP deliberately has no type-130 data channel, so its
+     * context is not marked connected. The main RTSP session is the transport
+     * owner in this mode; only exclude the separate type-130 path above. */
+    bool ready = p->mrp != NULL;
+    pthread_mutex_unlock(&p->mrp_lock);
+    if (ready) {
+        p->mrp_device_registered = false;
+        p->mrp_extended_registered = false;
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+        if (result.overall_status >= 200 && result.overall_status < 300) {
+            p->mrp_last_full_refresh_ms = now;
+            LOG_INFO("[MRP] command refresh completed (status=%d)",
+                     result.overall_status);
+        } else {
+            LOG_WARN("[MRP] command refresh failed (status=%d)",
+                     result.overall_status);
+        }
+    }
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+}
+
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
@@ -5435,13 +5619,15 @@ static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
     return false;
 }
 
-bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
-                           const char *artist, const char *album,
-                           int duration, const char *item_id,
-                           const char *content_type, const uint8_t *art_data,
-                           int art_len, bool *track_changed_out,
-                           ap2_mrp_artwork_info_t *mrp_info,
-                           ap2_mrp_push_result_t *mrp_push)
+bool ap2cl_set_metadata_ex_url(struct ap2cl_s *p, const char *title,
+                               const char *artist, const char *album,
+                               int duration, const char *item_id,
+                               const char *artwork_url,
+                               const char *content_type,
+                               const uint8_t *art_data, int art_len,
+                               bool *track_changed_out,
+                               ap2_mrp_artwork_info_t *mrp_info,
+                               ap2_mrp_push_result_t *mrp_push)
 {
     ap2_mrp_artwork_info_t local_info;
     if (!mrp_info) mrp_info = &local_info;
@@ -5459,17 +5645,19 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     bool channel_active = ap2_mrp_channel_active(p);
     bool track_changed = false;
     if (p->mrp)
-        ap2_mrp_set_track(p->mrp, title, artist, album, duration * 1000,
-                          item_id, content_type, art_data, art_len,
-                          &track_changed, mrp_info);
+        ap2_mrp_set_track_url(p->mrp, title, artist, album, duration * 1000,
+                              item_id, artwork_url, content_type, art_data,
+                              art_len, &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
     if (track_changed_out) *track_changed_out = track_changed;
 
+    bool send_dmap = ap2_mrp_should_send_dmap(channel_active);
     bool dmap_ok;
-    if (channel_active)
+    if (!send_dmap)
         dmap_ok = true;
     else if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
-        dmap_ok = ap2_native_send_metadata(p, title, artist, album);
+        dmap_ok = ap2_native_send_metadata(p, title, artist, album, duration,
+                                            item_id, have_art);
     else if (p->raopcl)
         dmap_ok = raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
                                   "asar", 's', artist, "asal", 's', album,
@@ -5480,7 +5668,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
      * Sonos-class receivers key it to the track they were just told about.
      * Only a same-item redundant image (MRP verdict "unchanged") is skipped,
      * matching ap2cl_set_artwork; MRP-rejected bytes still go out on DMAP. */
-    if (have_art && !channel_active && (track_changed ||
+    if (have_art && send_dmap && (track_changed ||
                      mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
         ap2_send_dmap_artwork(p, content_type, art_len,
                               (const char *)art_data);
@@ -5494,6 +5682,19 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     }
     pthread_mutex_unlock(&p->mrp_publish_lock);
     return dmap_ok;
+}
+
+bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+                           const char *artist, const char *album,
+                           int duration, const char *item_id,
+                           const char *content_type, const uint8_t *art_data,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
+                           ap2_mrp_push_result_t *mrp_push)
+{
+    return ap2cl_set_metadata_ex_url(p, title, artist, album, duration, item_id,
+                                     NULL, content_type, art_data, art_len,
+                                     track_changed_out, mrp_info, mrp_push);
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
@@ -5530,8 +5731,9 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         pthread_mutex_unlock(&p->mrp_publish_lock);
         return true;
     }
-    bool dmap_ok = channel_active ? true
-                            : ap2_send_dmap_artwork(p, content_type, size, data);
+    bool dmap_ok = ap2_mrp_should_send_dmap(channel_active)
+                       ? ap2_send_dmap_artwork(p, content_type, size, data)
+                       : true;
     if (have_mrp) {
         ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
         if (mrp_push) *mrp_push = result;
@@ -5915,6 +6117,23 @@ bool ap2cl_test_mrp_session_eligible(bool native, bool authenticated, bool apple
     return ap2_mrp_session_eligible(&client);
 }
 
+bool ap2cl_test_mrp_group_publisher(const char *device_address,
+                                    const char *leader_address,
+                                    size_t peer_count)
+{
+    char *peers[] = { (char *)leader_address, (char *)"192.0.2.2" };
+    struct ap2cl_s client = {
+        .device = {
+            .address = device_address,
+        },
+        .group_peers = peers,
+        .group_peer_count = peer_count,
+        .flow = FLOW_NATIVE_AP2,
+        .apple_model = true,
+    };
+    return ap2_mrp_session_eligible(&client);
+}
+
 bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 {
     return ap2_env_enabled(name, unset_default);
@@ -5923,6 +6142,11 @@ bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_mrp_dmap_enabled(bool channel_active)
+{
+    return ap2_mrp_should_send_dmap(channel_active);
 }
 
 /* Plant a probe-streak snapshot where the shared-daemon poller would put

@@ -173,6 +173,15 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
                        const char *mime, const uint8_t *art, int art_len,
                        bool *track_changed_out, ap2_mrp_artwork_info_t *info);
 
+/* Extended track setter carrying a receiver-reachable artwork URL. */
+bool ap2_mrp_set_track_url(struct ap2_mrp_ctx *m, const char *title,
+                           const char *artist, const char *album,
+                           int duration_ms, const char *item_id,
+                           const char *artwork_url, const char *mime,
+                           const uint8_t *art, int art_len,
+                           bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *info);
+
 /*
  * Set the now-playing track metadata without artwork: ap2_mrp_set_track with
  * no image, so a track change drops the retained artwork. Values are copied;
