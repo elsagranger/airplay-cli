@@ -827,13 +827,18 @@ The HAP secret input is 32 bytes for pair-verify credentials and the full
 64-byte SRP session key for transient PIN pairing. It is off by default for
 compatibility; `CLIAIRPLAY_MRP_TYPE130=1` enables it. Its value is parsed the
 same way as `CLIAIRPLAY_MRP`, so `0`/`false`/`off` keep it off. Once the channel
-is up, `SET_STATE` carries the full now-playing picture and the sender does not
-also publish `/command` or legacy DMAP metadata. The feedback worker re-pushes
-it every 15 s (`MRP_STATE_REPUSH_S`) as a defensive refresh. That push is
-skipped while the channel is down, which is why the default path has no
-periodic state refresh. `src/ap2_mrp.c` hand-rolls the proto2 emitters, the
-`/command` builders, the bplist `params.data` wrapper, the DataStream key
-derivation and channel framing, and answers inbound `sync` frames with `rply`.
+is up, the opening sequence selects `com.apple.Music` with
+`SET_NOW_PLAYING_CLIENT`, selects its stable `MediaRemote-DefaultPlayer` with
+`SET_NOW_PLAYING_PLAYER`, and sends the same complete `PlayerPath` in every
+`SET_STATE`. Omitting that path stores the queue under an empty client/player
+instead of the selected client. `SET_STATE` carries the full now-playing
+picture and the sender does not also publish `/command` or legacy DMAP
+metadata. The feedback worker re-pushes it every 15 s
+(`MRP_STATE_REPUSH_S`) as a defensive refresh. That push is skipped while the
+channel is down, which is why the default path has no periodic state refresh.
+`src/ap2_mrp.c` hand-rolls the proto2 emitters, the `/command` builders, the
+bplist `params.data` wrapper, the DataStream key derivation and channel
+framing, and answers inbound `sync` frames with `rply`.
 
 ## 9. Buffered audio (type 103)
 

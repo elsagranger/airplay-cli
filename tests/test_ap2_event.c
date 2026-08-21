@@ -1,4 +1,6 @@
 #include <assert.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,8 +35,9 @@ static void capture_remote_command(
     capture->commands[capture->count++] = command;
 }
 
-static void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
-                       uint8_t key[KEY_SIZE])
+static void derive_key_with_salt(const uint8_t secret[KEY_SIZE],
+                                 const char *salt, const char *info,
+                                 uint8_t key[KEY_SIZE])
 {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
     size_t len = KEY_SIZE;
@@ -42,12 +45,18 @@ static void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
     assert(EVP_PKEY_derive_init(ctx) > 0);
     assert(EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha512()) > 0);
     assert(EVP_PKEY_CTX_set1_hkdf_salt(
-               ctx, (const unsigned char *)"Events-Salt", 11) > 0);
+               ctx, (const unsigned char *)salt, strlen(salt)) > 0);
     assert(EVP_PKEY_CTX_set1_hkdf_key(ctx, secret, KEY_SIZE) > 0);
     assert(EVP_PKEY_CTX_add1_hkdf_info(
                ctx, (const unsigned char *)info, strlen(info)) > 0);
     assert(EVP_PKEY_derive(ctx, key, &len) > 0);
     EVP_PKEY_CTX_free(ctx);
+}
+
+static void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
+                       uint8_t key[KEY_SIZE])
+{
+    derive_key_with_salt(secret, "Events-Salt", info, key);
 }
 
 static void make_nonce(uint64_t counter, uint8_t nonce[12])
@@ -283,6 +292,101 @@ static bool contains_bytes(const uint8_t *haystack, int haystack_len,
     return false;
 }
 
+static void test_player_path_handshake(const uint8_t secret[KEY_SIZE])
+{
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    assert(listener >= 0);
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = 0,
+    };
+    assert(bind(listener, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(listen(listener, 1) == 0);
+    socklen_t address_len = sizeof(address);
+    assert(getsockname(
+               listener, (struct sockaddr *)&address, &address_len) == 0);
+
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
+        "Music Assistant", "11111111-2222-4333-8444-555555555555",
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret, KEY_SIZE);
+    assert(mrp);
+    const uint64_t seed = 123456789;
+    assert(ap2_mrp_attach(mrp, ntohs(address.sin_port), seed));
+
+    int peer = accept(listener, NULL, NULL);
+    assert(peer >= 0);
+    struct timeval timeout = {.tv_usec = 100000};
+    assert(setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO,
+                      &timeout, sizeof(timeout)) == 0);
+
+    char salt[64];
+    int salt_len = snprintf(
+        salt, sizeof(salt), "DataStream-Salt%llu",
+        (unsigned long long)seed);
+    assert(salt_len > 0 && salt_len < (int)sizeof(salt));
+    uint8_t output_key[KEY_SIZE];
+    derive_key_with_salt(
+        secret, salt, "DataStream-Output-Encryption-Key", output_key);
+
+    uint8_t plain_stream[32768];
+    int plain_stream_len = 0;
+    for (uint64_t counter = 0; counter < 64; counter++) {
+        uint8_t encrypted[2 + 1024 + TAG_SIZE];
+        ssize_t got = recv(peer, encrypted, 2, MSG_WAITALL);
+        if (got < 0) break;
+        assert(got == 2);
+        int cipher_len = encrypted[0] | (encrypted[1] << 8);
+        assert(cipher_len > 0 && cipher_len <= 1024);
+        int remaining = cipher_len + TAG_SIZE;
+        assert(recv(peer, encrypted + 2, (size_t)remaining, MSG_WAITALL) ==
+               remaining);
+        assert(plain_stream_len + cipher_len <= (int)sizeof(plain_stream));
+        int plain_len = decrypt_frame(
+            output_key, counter, encrypted, remaining + 2,
+            plain_stream + plain_stream_len);
+        assert(plain_len == cipher_len);
+        plain_stream_len += plain_len;
+    }
+
+    const uint8_t *payloads[8];
+    int payload_lengths[8];
+    int frame_count = 0;
+    int offset = 0;
+    while (offset < plain_stream_len) {
+        assert(plain_stream_len - offset >= 32);
+        uint32_t size = ((uint32_t)plain_stream[offset] << 24) |
+                        ((uint32_t)plain_stream[offset + 1] << 16) |
+                        ((uint32_t)plain_stream[offset + 2] << 8) |
+                        (uint32_t)plain_stream[offset + 3];
+        assert(size >= 32 && size <= (uint32_t)(plain_stream_len - offset));
+        assert(memcmp(plain_stream + offset + 4, "sync", 4) == 0);
+        assert(memcmp(plain_stream + offset + 16, "comm", 4) == 0);
+        assert(frame_count < 8);
+        payloads[frame_count] = plain_stream + offset + 32;
+        payload_lengths[frame_count] = (int)size - 32;
+        frame_count++;
+        offset += (int)size;
+    }
+
+    static const uint8_t player_id[] = "MediaRemote-DefaultPlayer";
+    assert(frame_count == 6);
+    assert(!contains_bytes(
+        payloads[3], payload_lengths[3], player_id,
+        (int)sizeof(player_id) - 1));
+    assert(contains_bytes(
+        payloads[4], payload_lengths[4], player_id,
+        (int)sizeof(player_id) - 1));
+    assert(contains_bytes(
+        payloads[5], payload_lengths[5], player_id,
+        (int)sizeof(player_id) - 1));
+
+    ap2_mrp_destroy(mrp);
+    close(peer);
+    close(listener);
+}
+
 static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
 {
     static const uint8_t first_art[] =
@@ -341,6 +445,7 @@ int main(void)
     derive_key(secret, "Events-Write-Encryption-Key", receiver_key);
     derive_key(secret, "Events-Read-Encryption-Key", sender_key);
     test_artwork_snapshot_generation(secret);
+    test_player_path_handshake(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);

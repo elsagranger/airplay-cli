@@ -118,7 +118,8 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
  * Derives the DataStream channel keys from the session shared secret given at
  * create time, opens the TCP connection to the receiver's dataPort, and
  * pushes the opening messages (DEVICE_INFO,
- * SET_CONNECTION_STATE, SET_NOW_PLAYING_CLIENT, initial SET_STATE).
+ * SET_CONNECTION_STATE, SET_NOW_PLAYING_CLIENT,
+ * SET_NOW_PLAYING_PLAYER, initial SET_STATE with the same PlayerPath).
  *
  * :param data_port: dataPort from the type-130 stream SETUP response.
  * :param seed: the random seed sent in the type-130 SETUP request (the

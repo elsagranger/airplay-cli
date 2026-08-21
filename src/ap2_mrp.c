@@ -95,6 +95,7 @@ enum mrp_msg_type {
     MRP_MSG_WAKE_DEVICE             = 41,
     MRP_MSG_GENERIC                 = 42,
     MRP_MSG_SET_NOW_PLAYING_CLIENT  = 46,
+    MRP_MSG_SET_NOW_PLAYING_PLAYER  = 47,
     MRP_MSG_UPDATE_CLIENT           = 55,
     MRP_MSG_UPDATE_CONTENT_ITEM     = 56,
     MRP_MSG_REMOVE_CLIENT           = 53,
@@ -113,6 +114,7 @@ enum mrp_ext_field {
     MRP_EXT_TRANSACTION             = 38,
     MRP_EXT_SET_CONNECTION_STATE    = 42,
     MRP_EXT_SET_NOW_PLAYING_CLIENT  = 50,
+    MRP_EXT_SET_NOW_PLAYING_PLAYER  = 51,
     MRP_EXT_CONFIGURE_CONNECTION    = 94,
 };
 
@@ -615,6 +617,48 @@ static bool build_set_now_playing_client(struct ap2_mrp_ctx *m, mbuf *out)
     return ok;
 }
 
+/* Attach SET_STATE to the same client/player selected by the opening
+ * registration. Without this path, receivers store the queue under an empty
+ * default client while com.apple.Music is marked as the active client. */
+static bool build_player_path(struct ap2_mrp_ctx *m, mbuf *out)
+{
+    bool ok = true;
+    mbuf origin = {0}, client = {0}, player = {0};
+
+    ok &= pb_put_varint_field(&origin, 1, 2);       /* Origin.Custom */
+    ok &= pb_put_string_field(&origin, 2, m->name); /* displayName */
+    ok &= pb_put_bool_field(&origin, 5, true);      /* isLocallyHosted */
+
+    ok = ok && build_now_playing_client(m, &client);
+
+    ok &= pb_put_string_field(&player, 1, "MediaRemote-DefaultPlayer");
+    ok &= pb_put_string_field(&player, 2, m->name);
+    ok &= pb_put_bool_field(&player, 3, true);      /* isDefaultPlayer */
+
+    ok = ok && pb_put_msg_field(out, 1, &origin);
+    ok = ok && pb_put_msg_field(out, 2, &client);
+    ok = ok && pb_put_msg_field(out, 3, &player);
+
+    mbuf_free(&origin);
+    mbuf_free(&client);
+    mbuf_free(&player);
+    return ok;
+}
+
+/* SET_NOW_PLAYING_PLAYER_MESSAGE (ext 51): playerPath = field 1. */
+static bool build_set_now_playing_player(struct ap2_mrp_ctx *m, mbuf *out)
+{
+    bool ok = true;
+    mbuf path = {0}, inner = {0};
+    ok = build_player_path(m, &path);
+    ok = ok && pb_put_msg_field(&inner, 1, &path);
+    ok = ok && mrp_envelope(out, MRP_MSG_SET_NOW_PLAYING_PLAYER,
+                            MRP_EXT_SET_NOW_PLAYING_PLAYER, &inner);
+    mbuf_free(&path);
+    mbuf_free(&inner);
+    return ok;
+}
+
 /* ContentItemMetadata for the current track (field numbers from
  * ContentItemMetadata.proto). */
 static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
@@ -677,14 +721,14 @@ static bool build_supported_commands(mbuf *sc)
 
 /* SET_STATE_MESSAGE (ext 9) carrying the full now-playing picture:
  * SetStateMessage { nowPlayingInfo=1, playbackQueue=3, displayName=5,
- * playbackState=6, playbackStateTimestamp=11 }; the queue holds one
+ * playbackState=6, playerPath=9, playbackStateTimestamp=11 }; the queue holds one
  * ContentItem { identifier=1, metadata=2, artworkData=3 }. */
 static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
                             mbuf *out)
 {
     bool ok = true;
     mbuf npi = {0}, meta = {0}, item = {0}, queue = {0}, sc = {0};
-    mbuf inner = {0};
+    mbuf player_path = {0}, inner = {0};
     double now_cf = mrp_cf_now();
 
     /* NowPlayingInfo (field numbers from NowPlayingInfo.proto) */
@@ -726,6 +770,8 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     ok = ok && pb_put_msg_field(&inner, 1, &npi);
     ok = ok && pb_put_msg_field(&inner, 2, &sc);                      /* supportedCommands */
     ok = ok && pb_put_msg_field(&inner, 3, &queue);
+    ok = ok && build_player_path(m, &player_path);
+    ok = ok && pb_put_msg_field(&inner, 9, &player_path);             /* playerPath */
     ok &= pb_put_string_field(&inner, 5, m->name);                    /* displayName */
     ok &= pb_put_varint_field(&inner, 6, m->playback_state);          /* playbackState */
     ok &= pb_put_double_field(&inner, 11, now_cf);                    /* playbackStateTimestamp */
@@ -737,6 +783,7 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     mbuf_free(&item);
     mbuf_free(&queue);
     mbuf_free(&sc);
+    mbuf_free(&player_path);
     mbuf_free(&inner);
     return ok;
 }
@@ -1581,8 +1628,8 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     LOG_INFO("[MRP] data channel connected to %s:%d", m->host, data_port);
 
     /* Opening sequence: DEVICE_INFO must be first (receiver stays silent
-     * otherwise), then connection state, updates config, now-playing client,
-     * followed by the initial full state. */
+     * otherwise), then connection state, updates config, now-playing client
+     * and player registration, followed by the initial full state. */
     bool ok = true;
     mbuf msg = {0};
     ok = ok && build_device_info(m, &msg) && mrp_send_protobuf(m, &msg);
@@ -1593,6 +1640,8 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     ok = ok && build_client_updates_config(&msg) && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
     ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
+    mbuf_free(&msg);
+    ok = ok && build_set_now_playing_player(m, &msg) && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
     ok = ok && mrp_push_state(m, m->artwork_len > 0);
     if (ok) {
@@ -1606,7 +1655,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
         return false;
     }
     LOG_INFO("[MRP] handshake pushed (device info, connection state, "
-             "now-playing client, initial state)");
+             "now-playing client/player, initial state)");
     return true;
 }
 
