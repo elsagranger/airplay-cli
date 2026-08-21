@@ -57,8 +57,8 @@ Decision order:
    native flow misbehaves.
 2. **Native vs RAOP-compat** — stored credentials (`--auth`) ⇒ native with
    pair-verify. `--ap2-native` ⇒ native with transient pairing.
-   Otherwise a device that advertises pairing (bit 46 or 48) with no PIN and
-   no legacy flag ⇒ native with transient pairing, provided it either does not
+   Otherwise a device that advertises pairing (bit 46 or 48) with no advertised
+   user-PIN requirement and no legacy flag ⇒ native with transient pairing, provided it either does not
    require a password or one was supplied with `--password` (§3a).
    `--protocol airplay2` takes that route on the same terms, and also when the
    TXT advertises no features at all — an AirPlay-2-only receiver, with no
@@ -626,6 +626,15 @@ Native MRP PIN pairing belongs to a separately advertised
 the HomePods used in this investigation. The full HAP `--pair-setup` code in
 this binary remains for receivers that actually expose that flow.
 
+**Transient PIN terminology.** HKP=4 is a session-only HAP mode, not the same
+thing as user-entered normal PIN pairing. The current HomePod path completes
+SRP M1-M4 with the fixed `3939` secret (or a configured device password), then
+derives session keys without storing M5/M6 controller credentials. Some
+third-party receivers also expose a true transient/no-PIN path when `pw=false`;
+therefore “transient” alone does not identify whether a PIN-like SRP secret was
+used. This distinction affects HAP pair-setup only; it does not add a PIN step to
+type-130.
+
 `CLIAIRPLAY_NOW_PLAYING_PROFILE=original` is a process-wide compatibility
 profile for controlled HomePod A/B tests. It keeps the current transport,
 stereo-group, PTP, and lifecycle code, but restores the v0.5.2 default metadata
@@ -1124,9 +1133,13 @@ callers:
   window is optional (Sonos omits it), so pacing falls back to 1.75 s — for
   the compiled default only, since an explicit `--latency` outranks a window
   that was never reported (§6).
-- **Pairing posture differs by vendor**: Sonos/JBL/WiiM accept transient
-  pairing (no PIN); Apple TV/HomePod require stored credentials from a PIN
-  pair-setup (transient returns 200 + an in-band TLV error and silence).
+- **Pairing posture differs by receiver and mode**: some third-party receivers
+  accept a true transient/no-PIN path, while many AirPlay 2 receivers use SRP
+  transient pairing with fixed `3939` or a device password. Normal Apple TV
+  pairing uses a displayed PIN and stores credentials. The current HomePod
+  path completed transient HAP without stored credentials; failed transient
+  probes on another receiver are receiver-policy observations, not proof that
+  type-130 requires PIN pairing.
 - **Sonos withholds audio until metadata arrives** (§10).
 - **Cross-VLAN**: HomeKit pairing and PTP do not survive subnet boundaries;
   same-L2 is assumed.

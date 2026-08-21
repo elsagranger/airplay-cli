@@ -135,6 +135,11 @@ from real device capabilities.
   from it). This is a generic capability; current HomePods normally use the
   transient HAP path below and do not advertise a separate native MRP PIN
   service.
+- **HomePod transient HAP**: the normal AirPlay path uses HKP=4 and M1-M4 only.
+  The current binary uses the fixed SRP secret `3939` (or a configured device
+  password), but does not ask the user for a displayed PIN or save long-term
+  pair-setup credentials. This is session authentication, not normal PIN
+  pairing.
 - **Sonos and most third-party AirPlay 2 receivers** need no pairing step: the
   native flow uses transient pairing automatically.
 - **HomePod MRP** is MediaRemote tunneled through AirPlay type 130. It reuses
