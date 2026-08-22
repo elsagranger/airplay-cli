@@ -8,8 +8,8 @@
  * DataStream keys. Protocol references live in DESIGN.md §8.
  *
  * The `/command` path carries sender now-playing state. The optional type-130
- * channel provides remote-control transport and is kept for future inbound
- * command handling.
+ * channel carries receiver-originated remote commands as protobuf messages;
+ * decoded events share the reverse-command callback below.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -22,6 +22,8 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <ctype.h>
+#include <limits.h>
+#include <math.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -107,6 +109,7 @@ enum mrp_msg_type {
 /* ProtocolMessage extension field numbers of the inner messages we emit
  * (pyatv protobuf sources, the "extend ProtocolMessage" blocks). */
 enum mrp_ext_field {
+    MRP_EXT_SEND_COMMAND             = 6,
     MRP_EXT_SET_STATE               = 9,
     MRP_EXT_SET_ARTWORK             = 10,
     MRP_EXT_DEVICE_INFO             = 20,
@@ -135,6 +138,17 @@ enum mrp_ext_field {
 #define MRP_CMD_TOGGLE_PLAY_PAUSE  3
 #define MRP_CMD_NEXT_TRACK         5
 #define MRP_CMD_PREVIOUS_TRACK     6
+#define MRP_CMD_SEEK_TO_POSITION   45   /* CommandInfo.proto / type-130 */
+
+/* MRMediaRemoteCommand numbering used by updateMRSupportedCommands on the
+ * main event path. This is intentionally different from CommandInfo.proto's
+ * type-130 enum above (Apple's seek command is 24 there, 45 here). */
+#define MR_MEDIA_REMOTE_COMMAND_SEEK_TO_POSITION 24
+#define MR_MEDIA_REMOTE_COMMAND_PLAY              0
+#define MR_MEDIA_REMOTE_COMMAND_PAUSE             1
+#define MR_MEDIA_REMOTE_COMMAND_TOGGLE_PLAY_PAUSE 2
+#define MR_MEDIA_REMOTE_COMMAND_NEXT_TRACK        4
+#define MR_MEDIA_REMOTE_COMMAND_PREVIOUS_TRACK   5
 
 /* Apple epoch (CFAbsoluteTime): seconds between 1970-01-01 and 2001-01-01.
  * MRP timestamps are doubles on this timebase. */
@@ -157,8 +171,11 @@ struct ap2_mrp_ctx {
     char *session_uuid;       /* active AirPlay session */
     char *group_uuid;         /* active AirPlay group */
     char device_uuid[37];     /* stable UUID derived from dacp_id */
+    int32_t origin_identifier; /* custom MROrigin identifier (nonzero) */
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
+    ap2_remote_event_cb_t remote_event_cb;
+    void *remote_event_userdata;
 
     /* Channel crypto. The DataStream keys derive from the pairing shared
      * secret of the RTSP session that performed the type-130 SETUP. */
@@ -501,6 +518,23 @@ static bool pb_put_float_field(mbuf *b, uint32_t field, float v)
     return pb_put_key(b, field, 5) && mbuf_put(b, le, 4);
 }
 
+/* The sender-side app identity is separate from the receiver's display name.
+ * Keep the historical Music identity by default, while allowing a native Mac
+ * host (for example MusicBox) to advertise its actual bundle identifier for an
+ * A/B run without changing the public create() ABI. */
+static const char *mrp_bundle_identifier(void)
+{
+    const char *value = getenv("CLIAIRPLAY_MEDIAREMOTE_BUNDLE_IDENTIFIER");
+    return value && *value ? value : "com.apple.Music";
+}
+
+static bool mrp_client_updates_enabled(void)
+{
+    const char *value = getenv("CLIAIRPLAY_MEDIAREMOTE_CLIENT_UPDATES");
+    return value && *value && strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 && strcasecmp(value, "off") != 0;
+}
+
 /* Embed a fully built submessage as a length-delimited field. */
 static bool pb_put_msg_field(mbuf *b, uint32_t field, const mbuf *sub)
 {
@@ -536,12 +570,14 @@ static bool build_device_info(struct ap2_mrp_ctx *m, mbuf *out)
     ok &= pb_put_string_field(&inner, 2, m->name);              /* name (required) */
     ok &= pb_put_string_field(&inner, 3, "iPhone");             /* localizedModelName */
     ok &= pb_put_string_field(&inner, 4, "21F90");              /* systemBuildVersion */
-    ok &= pb_put_string_field(&inner, 5, "com.apple.Music");    /* applicationBundleIdentifier */
+    ok &= pb_put_string_field(&inner, 5, mrp_bundle_identifier());
+    /* applicationBundleIdentifier */
     ok &= pb_put_varint_field(&inner, 7, 1);                    /* protocolVersion */
     ok &= pb_put_varint_field(&inner, 8, 139);                  /* lastSupportedMessageType (captured from a real iPhone) */
     ok &= pb_put_bool_field(&inner, 9, true);                   /* supportsSystemPairing */
     ok &= pb_put_bool_field(&inner, 10, true);                  /* allowsPairing */
-    ok &= pb_put_string_field(&inner, 12, "com.apple.Music");   /* systemMediaApplication */
+    ok &= pb_put_string_field(&inner, 12, mrp_bundle_identifier());
+    /* systemMediaApplication */
     ok &= pb_put_bool_field(&inner, 13, true);                  /* supportsACL */
     ok &= pb_put_bool_field(&inner, 14, true);                  /* supportsSharedQueue */
     ok &= pb_put_bool_field(&inner, 15, true);                  /* supportsExtendedMotion */
@@ -573,19 +609,23 @@ static bool build_set_connection_state(mbuf *out, int state)
     return ok;
 }
 
-/* CLIENT_UPDATES_CONFIG_MESSAGE (ext 21): this is the sender's current
- * assumption, not a receiver-proven contract. A sender pushes state rather
- * than subscribing, so the fields are currently all off; keep this isolated
- * because a HomePod may use the flags when deciding which client is active. */
+/* CLIENT_UPDATES_CONFIG_MESSAGE (ext 21): this is a sidecar registration
+ * profile, not a receiver-proven sender contract. The default is sender-only;
+ * CLIAIRPLAY_MEDIAREMOTE_CLIENT_UPDATES=1 selects the observer-style profile
+ * for an isolated hardware A/B. */
 static bool build_client_updates_config(mbuf *out)
 {
     bool ok = true;
     mbuf inner = {0};
-    ok &= pb_put_bool_field(&inner, 1, false);   /* artworkUpdates */
+    bool subscribe = mrp_client_updates_enabled();
+    /* The default remains sender-only. The opt-in values mirror pyatv's
+     * observer profile and isolate the registration hypothesis for hardware
+     * A/B runs; they are not required by the main /command sender path. */
+    ok &= pb_put_bool_field(&inner, 1, subscribe); /* artworkUpdates */
     ok &= pb_put_bool_field(&inner, 2, false);   /* nowPlayingUpdates */
-    ok &= pb_put_bool_field(&inner, 3, false);   /* volumeUpdates */
-    ok &= pb_put_bool_field(&inner, 4, false);   /* keyboardUpdates */
-    ok &= pb_put_bool_field(&inner, 5, false);   /* outputDeviceUpdates */
+    ok &= pb_put_bool_field(&inner, 3, subscribe); /* volumeUpdates */
+    ok &= pb_put_bool_field(&inner, 4, subscribe); /* keyboardUpdates */
+    ok &= pb_put_bool_field(&inner, 5, subscribe); /* outputDeviceUpdates */
     ok = ok && mrp_envelope(out, MRP_MSG_CLIENT_UPDATES_CONFIG,
                             MRP_EXT_CLIENT_UPDATES_CONFIG, &inner);
     mbuf_free(&inner);
@@ -599,7 +639,7 @@ static bool build_now_playing_client(struct ap2_mrp_ctx *m, mbuf *client)
 {
     bool ok = true;
     ok &= pb_put_varint_field(client, 1, (uint64_t)getpid());
-    ok &= pb_put_string_field(client, 2, "com.apple.Music");
+    ok &= pb_put_string_field(client, 2, mrp_bundle_identifier());
     ok &= pb_put_string_field(client, 7, m->name);
     return ok;
 }
@@ -620,7 +660,10 @@ static bool build_set_now_playing_client(struct ap2_mrp_ctx *m, mbuf *out)
 
 /* Attach SET_STATE to the same client/player selected by the opening
  * registration. Without this path, receivers store the queue under an empty
- * default client while com.apple.Music is marked as the active client. */
+ * default client while com.apple.Music is marked as the active client. This is
+ * an experimental type-130 sender shape: native AirPlaySender binds its local
+ * MediaRemote destination to the main TransportControlStream, and does not
+ * establish this standalone sender queue. */
 static bool build_player_path(struct ap2_mrp_ctx *m, mbuf *out)
 {
     bool ok = true;
@@ -628,6 +671,8 @@ static bool build_player_path(struct ap2_mrp_ctx *m, mbuf *out)
 
     ok &= pb_put_varint_field(&origin, 1, 2);       /* Origin.Custom */
     ok &= pb_put_string_field(&origin, 2, m->name); /* displayName */
+    ok &= pb_put_varint_field(&origin, 3,
+                              (uint32_t)m->origin_identifier); /* identifier */
     ok &= pb_put_bool_field(&origin, 5, true);      /* isLocallyHosted */
 
     ok = ok && build_now_playing_client(m, &client);
@@ -708,12 +753,15 @@ static bool build_supported_commands(mbuf *sc)
     static const uint32_t cmds[] = {
         MRP_CMD_PLAY, MRP_CMD_PAUSE, MRP_CMD_TOGGLE_PLAY_PAUSE,
         MRP_CMD_NEXT_TRACK, MRP_CMD_PREVIOUS_TRACK,
+        MRP_CMD_SEEK_TO_POSITION,
     };
     bool ok = true;
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         mbuf ci = {0};
         ok &= pb_put_varint_field(&ci, 1, cmds[i]);   /* command (enum) */
         ok &= pb_put_bool_field(&ci, 2, true);        /* enabled */
+        if (cmds[i] == MRP_CMD_SEEK_TO_POSITION)
+            ok &= pb_put_varint_field(&ci, 16, 1);    /* canScrub */
         ok = ok && pb_put_msg_field(sc, 1, &ci);      /* repeated supportedCommands */
         mbuf_free(&ci);
     }
@@ -1106,10 +1154,225 @@ static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
         mrp_close_data_channel(m);
 }
 
-/* Consume complete 32-byte-header data frames from rx_msg. Incoming protobufs
- * are counted but not dispatched: acting on them (SendCommand transport
- * controls from the receiver: play/pause/next from the Siri remote) is not
- * implemented (DESIGN.md §8). */
+static void mrp_emit_remote_event(struct ap2_mrp_ctx *m,
+                                  const ap2_remote_event_t *event);
+
+static bool mrp_pb_read_varint(const uint8_t *data, size_t len, size_t *off,
+                               uint64_t *value)
+{
+    if (!data || !off || !value) return false;
+    uint64_t result = 0;
+    for (unsigned shift = 0; shift < 64 && *off < len; shift += 7) {
+        uint8_t byte = data[(*off)++];
+        result |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) {
+            *value = result;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Walk one protobuf message and expose the next field without assuming a
+ * generated schema. The type-130 command path only needs varints, length-
+ * delimited submessages, and fixed64 playbackPosition. */
+static bool mrp_pb_next_field(const uint8_t *data, size_t len, size_t *off,
+                              uint32_t *field, uint8_t *wire,
+                              uint64_t *varint, const uint8_t **bytes,
+                              size_t *bytes_len)
+{
+    uint64_t key;
+    if (!mrp_pb_read_varint(data, len, off, &key) || key >> 3 == 0 ||
+        key >> 3 > UINT32_MAX)
+        return false;
+    *field = (uint32_t)(key >> 3);
+    *wire = (uint8_t)(key & 7);
+    if (bytes) *bytes = NULL;
+    if (bytes_len) *bytes_len = 0;
+    switch (*wire) {
+    case 0:
+        return mrp_pb_read_varint(data, len, off, varint);
+    case 1:
+        if (*off + 8 > len) return false;
+        if (bytes) *bytes = data + *off;
+        if (bytes_len) *bytes_len = 8;
+        *off += 8;
+        return true;
+    case 2: {
+        uint64_t length;
+        if (!mrp_pb_read_varint(data, len, off, &length) ||
+            length > len - *off)
+            return false;
+        if (bytes) *bytes = data + *off;
+        if (bytes_len) *bytes_len = (size_t)length;
+        *off += (size_t)length;
+        return true;
+    }
+    case 5:
+        if (*off + 4 > len) return false;
+        if (bytes) *bytes = data + *off;
+        if (bytes_len) *bytes_len = 4;
+        *off += 4;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool mrp_pb_find_varint(const uint8_t *data, size_t len,
+                               uint32_t wanted, uint64_t *value)
+{
+    size_t off = 0;
+    while (off < len) {
+        uint32_t field;
+        uint8_t wire;
+        uint64_t varint = 0;
+        if (!mrp_pb_next_field(data, len, &off, &field, &wire, &varint,
+                               NULL, NULL))
+            return false;
+        if (field == wanted && wire == 0) {
+            *value = varint;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mrp_pb_find_bytes(const uint8_t *data, size_t len,
+                              uint32_t wanted, const uint8_t **bytes,
+                              size_t *bytes_len)
+{
+    size_t off = 0;
+    while (off < len) {
+        uint32_t field;
+        uint8_t wire;
+        uint64_t varint = 0;
+        const uint8_t *field_bytes = NULL;
+        size_t field_len = 0;
+        if (!mrp_pb_next_field(data, len, &off, &field, &wire, &varint,
+                               &field_bytes, &field_len))
+            return false;
+        if (field == wanted && wire == 2) {
+            *bytes = field_bytes;
+            *bytes_len = field_len;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mrp_pb_find_fixed64_double(const uint8_t *data, size_t len,
+                                       uint32_t wanted, double *value)
+{
+    size_t off = 0;
+    while (off < len) {
+        uint32_t field;
+        uint8_t wire;
+        uint64_t varint = 0;
+        const uint8_t *field_bytes = NULL;
+        size_t field_len = 0;
+        if (!mrp_pb_next_field(data, len, &off, &field, &wire, &varint,
+                               &field_bytes, &field_len))
+            return false;
+        if (field == wanted && wire == 1 && field_len == sizeof(uint64_t)) {
+            uint64_t bits = 0;
+            for (size_t i = 0; i < sizeof(bits); i++)
+                bits |= (uint64_t)field_bytes[i] << (i * 8);
+            memcpy(value, &bits, sizeof(bits));
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mrp_map_main_command(int command_id,
+                                 ap2_remote_command_t *command)
+{
+    if (!command) return false;
+    switch (command_id) {
+    case MR_MEDIA_REMOTE_COMMAND_PLAY:
+        *command = AP2_REMOTE_COMMAND_PLAY;
+        return true;
+    case MR_MEDIA_REMOTE_COMMAND_PAUSE:
+        *command = AP2_REMOTE_COMMAND_PAUSE;
+        return true;
+    case MR_MEDIA_REMOTE_COMMAND_TOGGLE_PLAY_PAUSE:
+        *command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
+        return true;
+    case MR_MEDIA_REMOTE_COMMAND_NEXT_TRACK:
+        *command = AP2_REMOTE_COMMAND_NEXT;
+        return true;
+    case MR_MEDIA_REMOTE_COMMAND_PREVIOUS_TRACK:
+        *command = AP2_REMOTE_COMMAND_PREVIOUS;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool mrp_parse_type130_command(const uint8_t *payload, size_t payload_len,
+                                      ap2_remote_event_t *event)
+{
+    uint8_t *blob = NULL;
+    size_t blob_len = 0;
+    if (!ap2_bplist_find_data(payload, payload_len, "data", &blob, &blob_len))
+        return false;
+
+    bool parsed = false;
+    size_t offset = 0;
+    uint64_t protobuf_len = 0;
+    if (!mrp_pb_read_varint(blob, blob_len, &offset, &protobuf_len) ||
+        protobuf_len > blob_len - offset)
+        goto done;
+
+    const uint8_t *message = blob + offset;
+    size_t message_len = (size_t)protobuf_len;
+    uint64_t type = 0;
+    const uint8_t *inner = NULL;
+    size_t inner_len = 0;
+    if (!mrp_pb_find_varint(message, message_len, 1, &type) ||
+        type != MRP_MSG_SEND_COMMAND ||
+        !mrp_pb_find_bytes(message, message_len, MRP_EXT_SEND_COMMAND,
+                           &inner, &inner_len))
+        goto done;
+
+    uint64_t command = 0;
+    if (!mrp_pb_find_varint(inner, inner_len, 1, &command)) goto done;
+    memset(event, 0, sizeof(*event));
+    switch (command) {
+    case MRP_CMD_PLAY: event->command = AP2_REMOTE_COMMAND_PLAY; break;
+    case MRP_CMD_PAUSE: event->command = AP2_REMOTE_COMMAND_PAUSE; break;
+    case MRP_CMD_TOGGLE_PLAY_PAUSE:
+        event->command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
+        break;
+    case MRP_CMD_NEXT_TRACK: event->command = AP2_REMOTE_COMMAND_NEXT; break;
+    case MRP_CMD_PREVIOUS_TRACK:
+        event->command = AP2_REMOTE_COMMAND_PREVIOUS;
+        break;
+    case MRP_CMD_SEEK_TO_POSITION: {
+        const uint8_t *options = NULL;
+        size_t options_len = 0;
+        double position = 0.0;
+        if (!mrp_pb_find_bytes(inner, inner_len, 2, &options, &options_len) ||
+            !mrp_pb_find_fixed64_double(options, options_len, 9, &position) ||
+            !isfinite(position) || position < 0.0)
+            goto done;
+        event->command = AP2_REMOTE_COMMAND_SEEK;
+        event->has_position = true;
+        event->position_seconds = position;
+        break;
+    }
+    default:
+        goto done;
+    }
+    parsed = true;
+
+done:
+    free(blob);
+    return parsed;
+}
+
+/* Consume complete 32-byte-header data frames from rx_msg. */
 static void mrp_process_frames(struct ap2_mrp_ctx *m)
 {
     int off = 0;
@@ -1130,6 +1393,10 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
         if (memcmp(h + 4, "sync", 4) == 0) {
             LOG_DEBUG("[MRP] inbound sync frame (%u bytes, seq %llu)",
                       size, (unsigned long long)seqno);
+            ap2_remote_event_t event;
+            if (mrp_parse_type130_command(
+                    h + MRP_DATA_HDR_LEN, size - MRP_DATA_HDR_LEN, &event))
+                mrp_emit_remote_event(m, &event);
             mrp_send_reply(m, seqno);
         } else {
             LOG_DEBUG("[MRP] inbound frame %.4s (%u bytes)", (const char *)(h + 4), size);
@@ -1203,11 +1470,26 @@ void ap2_mrp_set_remote_command_callback(
     m->remote_command_userdata = userdata;
 }
 
-static void mrp_emit_remote_command(
-    struct ap2_mrp_ctx *m, ap2_remote_command_t command)
+void ap2_mrp_set_remote_event_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_event_cb_t callback, void *userdata)
 {
-    if (m->remote_command_cb)
-        m->remote_command_cb(command, m->remote_command_userdata);
+    if (!m) return;
+    m->remote_event_cb = callback;
+    m->remote_event_userdata = userdata;
+}
+
+static void mrp_emit_remote_event(struct ap2_mrp_ctx *m,
+                                  const ap2_remote_event_t *event)
+{
+    if (!m || !event) return;
+    if (m->remote_event_cb)
+        m->remote_event_cb(event, m->remote_event_userdata);
+    /* Preserve the original callback ABI for the five legacy transport
+     * commands. Seek is intentionally delivered only through the richer event
+     * callback until an upper layer can perform an actual stream re-anchor. */
+    if (m->remote_command_cb && !event->has_position &&
+        event->command != AP2_REMOTE_COMMAND_SEEK)
+        m->remote_command_cb(event->command, m->remote_command_userdata);
 }
 
 static bool mrp_bplist_get_root_string(const uint8_t *body, int body_len,
@@ -1228,32 +1510,76 @@ static bool mrp_bplist_get_event_string(const uint8_t *body, int body_len,
            mrp_bplist_get_root_string(body, body_len, lower_key, out, out_size);
 }
 
-static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
-                                     ap2_remote_command_t *command)
+static bool mrp_parse_remote_event(const uint8_t *body, int body_len,
+                                   ap2_remote_event_t *event)
 {
-    if (!body || body_len < 8 || !command ||
+    if (!body || body_len < 8 || !event ||
         memcmp(body, "bplist00", 8) != 0)
         return false;
 
+    memset(event, 0, sizeof(*event));
+
     char type[64];
-    char value[64];
+    char value[64] = "";
     if (!mrp_bplist_get_event_string(body, body_len, "type", "Type", type,
                                      sizeof(type)) ||
-        strcmp(type, "sendMediaRemoteCommand") != 0 ||
-        !mrp_bplist_get_event_string(body, body_len, "value", "Value", value,
-                                     sizeof(value)))
+        strcmp(type, "sendMediaRemoteCommand") != 0)
         return false;
 
+    bool have_value = mrp_bplist_get_event_string(
+        body, body_len, "value", "Value", value, sizeof(value));
+    char modern_command[32] = "";
+    bool have_modern_command = mrp_bplist_get_event_string(
+        body, body_len, "modernMediaRemoteCommand", "ModernMediaRemoteCommand",
+        modern_command, sizeof(modern_command));
+    uint64_t modern_command_number = 0;
+    bool have_modern_number = ap2_bplist_find_uint(
+        body, (size_t)body_len, "modernMediaRemoteCommand",
+        &modern_command_number);
+    int command_id = -1;
+    if (have_modern_command) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(modern_command, &end, 10);
+        if (end != modern_command && *end == '\0' && parsed <= INT_MAX)
+            command_id = (int)parsed;
+    } else if (have_modern_number && modern_command_number <= INT_MAX) {
+        command_id = (int)modern_command_number;
+    }
+
+    double position = 0.0;
+    bool have_position = ap2_bplist_find_real(
+        body, (size_t)body_len, "kMRMediaRemoteOptionPlaybackPosition",
+        &position);
+    bool seek_value = have_value &&
+        (!strcmp(value, "seek") || !strcmp(value, "scrub") ||
+         !strcmp(value, "seekToPlaybackPosition") ||
+         !strcmp(value, "setPosition"));
+    if ((command_id == MR_MEDIA_REMOTE_COMMAND_SEEK_TO_POSITION || seek_value) &&
+        have_position && isfinite(position) && position >= 0.0) {
+        event->command = AP2_REMOTE_COMMAND_SEEK;
+        event->has_position = true;
+        event->position_seconds = position;
+        return true;
+    }
+
+    /* Newer MediaRemote senders may omit the legacy four-character `value`
+     * and carry only the numeric command. Accept that native form for the
+     * transport controls as well as seek. */
+    if (command_id >= 0 && mrp_map_main_command(command_id, &event->command))
+        return true;
+
+    if (!have_value) return false;
+
     if (strcmp(value, "play") == 0)
-        *command = AP2_REMOTE_COMMAND_PLAY;
+        event->command = AP2_REMOTE_COMMAND_PLAY;
     else if (strcmp(value, "paus") == 0)
-        *command = AP2_REMOTE_COMMAND_PAUSE;
+        event->command = AP2_REMOTE_COMMAND_PAUSE;
     else if (strcmp(value, "plps") == 0)
-        *command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
+        event->command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
     else if (strcmp(value, "nitm") == 0)
-        *command = AP2_REMOTE_COMMAND_NEXT;
+        event->command = AP2_REMOTE_COMMAND_NEXT;
     else if (strcmp(value, "pitm") == 0)
-        *command = AP2_REMOTE_COMMAND_PREVIOUS;
+        event->command = AP2_REMOTE_COMMAND_PREVIOUS;
     else
         return false;
     return true;
@@ -1272,20 +1598,55 @@ static void mrp_log_event_command_body(const char *header,
     if (body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
         char type[256];
         char value[256];
+        char modern_command[64];
         char safe_type[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
         char safe_value[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
+        char safe_modern[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
         bool have_type = mrp_bplist_get_event_string(
             body, body_len, "type", "Type", type, sizeof(type));
         bool have_value = mrp_bplist_get_event_string(
             body, body_len, "value", "Value", value, sizeof(value));
+        bool have_modern = mrp_bplist_get_event_string(
+            body, body_len, "modernMediaRemoteCommand",
+            "ModernMediaRemoteCommand", modern_command,
+            sizeof(modern_command));
+        uint64_t modern_number = 0;
+        bool have_modern_number = ap2_bplist_find_uint(
+            body, (size_t)body_len, "modernMediaRemoteCommand",
+            &modern_number);
+        double position = 0.0;
+        bool have_position = ap2_bplist_find_real(
+            body, (size_t)body_len,
+            "kMRMediaRemoteOptionPlaybackPosition", &position);
         if (have_type)
             mrp_event_log_text(safe_type, type);
         if (have_value)
             mrp_event_log_text(safe_value, value);
+        if (have_modern)
+            mrp_event_log_text(safe_modern, modern_command);
+        else if (have_modern_number)
+            snprintf(safe_modern, sizeof(safe_modern), "%llu",
+                     (unsigned long long)modern_number);
         if (safe_type[0] && safe_value[0]) {
-            LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
-                      "type=%s value=%s",
-                      safe_content_type, body_len, safe_type, safe_value);
+            if (have_position) {
+                LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
+                          "type=%s value=%s modern=%s position=%.3f",
+                          safe_content_type, body_len, safe_type, safe_value,
+                          safe_modern[0] ? safe_modern : "<missing>", position);
+            } else {
+                LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
+                          "type=%s value=%s modern=%s",
+                          safe_content_type, body_len, safe_type, safe_value,
+                          safe_modern[0] ? safe_modern : "<missing>");
+            }
+            return;
+        }
+        if (safe_type[0] && (safe_modern[0] || have_position)) {
+            LOG_DEBUG("[MRP] event bplist content_type=%s content_length=%d "
+                      "type=%s modern=%s position=%s%.3f",
+                      safe_content_type, body_len, safe_type,
+                      safe_modern[0] ? safe_modern : "<missing>",
+                      have_position ? "" : "<missing>", position);
             return;
         }
         if (safe_type[0]) {
@@ -1373,12 +1734,12 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
         bool is_command = content_len > 0 &&
                           strcasecmp(method, "POST") == 0 &&
                           strcmp(path, "/command") == 0;
-        ap2_remote_command_t remote_command;
-        bool have_remote_command = false;
+        ap2_remote_event_t remote_event;
+        bool have_remote_event = false;
         if (is_command) {
             const uint8_t *body = m->event_plain + off + header_len;
-            have_remote_command =
-                mrp_parse_remote_command(body, content_len, &remote_command);
+            have_remote_event =
+                mrp_parse_remote_event(body, content_len, &remote_event);
             if (*loglevel >= lDEBUG)
                 mrp_log_event_command_body(header, body, content_len);
         }
@@ -1407,8 +1768,8 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             response_len > 0 && response_len < (int)sizeof(response) &&
             mrp_event_send_response(
                 m, (const uint8_t *)response, response_len);
-        if (have_remote_command)
-            mrp_emit_remote_command(m, remote_command);
+        if (have_remote_event)
+            mrp_emit_remote_event(m, &remote_event);
         if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;
@@ -1501,6 +1862,10 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     m->session_uuid = mrp_strdup(session_uuid);
     m->group_uuid = mrp_strdup(group_uuid);
     mrp_identity_uuid(m->dacp_id, m->device_uuid);
+    uint32_t origin_identifier = 0;
+    RAND_bytes((uint8_t *)&origin_identifier, sizeof(origin_identifier));
+    m->origin_identifier = (int32_t)(origin_identifier & 0x7FFFFFFFU);
+    if (m->origin_identifier == 0) m->origin_identifier = 1;
     m->playback_state = AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
     m->state_generation = 1;
@@ -2058,6 +2423,29 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     return true;
 }
 
+bool ap2_mrp_build_clear_nowplaying_command(struct ap2_mrp_ctx *m,
+                                            uint8_t **out, int *out_len)
+{
+    if (!m || !out || !out_len) return false;
+
+    /* AirPlaySender's flushMetadata passes an empty dictionary through the
+     * same npi-text/replace envelope before it publishes Stopped. */
+    ap2_pl_node *info = ap2_pl_dict();
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "type", ap2_pl_string("npi-text"));
+    ap2_pl_dict_set(params, "mergePolicy", ap2_pl_string("replace"));
+    ap2_pl_dict_set(params, "params", info);
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRNowPlayingInfo"));
+    ap2_pl_dict_set(root, "params", params);
+
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
 bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
                                                uint8_t **out, int *out_len)
 {
@@ -2179,7 +2567,7 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
 
     ap2_pl_node *o24 = ap2_pl_dict();
     ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
-                    ap2_pl_bool(false));
+                    ap2_pl_bool(true));
     ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
                     ap2_pl_bool(false));
     ap2_pl_array_append(arr, mrp_cmd_info_blob(24, true, o24));
@@ -2198,6 +2586,23 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
 
     ap2_pl_node *params = ap2_pl_dict();
     ap2_pl_dict_set(params, "mrSupportedCommandsFromSender", arr);
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRSupportedCommands"));
+    ap2_pl_dict_set(root, "params", params);
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
+bool ap2_mrp_build_empty_supportedcommands_command(
+    struct ap2_mrp_ctx *m, uint8_t **out, int *out_len)
+{
+    (void)m;
+    if (!out || !out_len) return false;
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "mrSupportedCommandsFromSender", ap2_pl_array());
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRSupportedCommands"));
     ap2_pl_dict_set(root, "params", params);

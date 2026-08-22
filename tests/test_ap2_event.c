@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <arpa/inet.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -13,6 +14,7 @@
 #include <openssl/kdf.h>
 
 #include "ap2_mrp.h"
+#include "ap2_bplist.h"
 #include "ap2_plist.h"
 #include "cross_log.h"
 
@@ -21,6 +23,11 @@
 
 struct command_capture {
     ap2_remote_command_t commands[16];
+    int count;
+};
+
+struct event_capture {
+    ap2_remote_event_t events[16];
     int count;
 };
 
@@ -33,6 +40,13 @@ static void capture_remote_command(
     struct command_capture *capture = userdata;
     assert(capture && capture->count < 16);
     capture->commands[capture->count++] = command;
+}
+
+static void capture_remote_event(const ap2_remote_event_t *event, void *userdata)
+{
+    struct event_capture *capture = userdata;
+    assert(capture && event && capture->count < 16);
+    capture->events[capture->count++] = *event;
 }
 
 static void derive_key_with_salt(const uint8_t secret[KEY_SIZE],
@@ -204,6 +218,44 @@ static int build_command_request(uint8_t *encrypted, size_t encrypted_size,
         "sendMediaRemoteCommand", value);
 }
 
+static int build_seek_request(uint8_t *encrypted, size_t encrypted_size,
+                              const uint8_t key[KEY_SIZE],
+                              uint64_t counter, int cseq, double position)
+{
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "kMRMediaRemoteOptionPlaybackPosition",
+                    ap2_pl_real(position));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "modernMediaRemoteCommand", ap2_pl_string("24"));
+    ap2_pl_dict_set(root, "params", params);
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
+static int build_modern_command_request(
+    uint8_t *encrypted, size_t encrypted_size,
+    const uint8_t key[KEY_SIZE], uint64_t counter, int cseq, int command)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "modernMediaRemoteCommand", ap2_pl_int(command));
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
 static int build_embedded_nul_request(
     uint8_t *encrypted, size_t encrypted_size,
     const uint8_t key[KEY_SIZE], uint64_t counter, int cseq)
@@ -292,6 +344,99 @@ static bool contains_bytes(const uint8_t *haystack, int haystack_len,
     return false;
 }
 
+static int put_test_varint(uint8_t *out, int cap, uint64_t value)
+{
+    int used = 0;
+    do {
+        assert(used < cap);
+        uint8_t byte = (uint8_t)(value & 0x7F);
+        value >>= 7;
+        out[used++] = value ? (uint8_t)(byte | 0x80) : byte;
+    } while (value);
+    return used;
+}
+
+static int put_test_field_varint(uint8_t *out, int cap, uint32_t field,
+                                 uint64_t value)
+{
+    int used = put_test_varint(out, cap, (uint64_t)field << 3);
+    used += put_test_varint(out + used, cap - used, value);
+    return used;
+}
+
+static int put_test_field_bytes(uint8_t *out, int cap, uint32_t field,
+                                const uint8_t *data, int len)
+{
+    int used = put_test_varint(out, cap, ((uint64_t)field << 3) | 2);
+    used += put_test_varint(out + used, cap - used, (uint64_t)len);
+    assert(used + len <= cap);
+    memcpy(out + used, data, (size_t)len);
+    return used + len;
+}
+
+static int put_test_field_fixed64(uint8_t *out, int cap, uint32_t field,
+                                  double value)
+{
+    int used = put_test_varint(out, cap, ((uint64_t)field << 3) | 1);
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    assert(used + 8 <= cap);
+    for (int i = 0; i < 8; i++) out[used++] = (uint8_t)(bits >> (i * 8));
+    return used;
+}
+
+static int build_type130_seek_frame(
+    const uint8_t key[KEY_SIZE], uint64_t counter, uint64_t seqno,
+    double position, uint8_t *encrypted, size_t encrypted_size)
+{
+    uint8_t options[64];
+    int options_len = put_test_field_fixed64(
+        options, (int)sizeof(options), 9, position); /* playbackPosition */
+    uint8_t command[128];
+    int command_len = put_test_field_varint(
+        command, (int)sizeof(command), 1, 45); /* SeekToPlaybackPosition */
+    command_len += put_test_field_bytes(
+        command + command_len, (int)sizeof(command) - command_len,
+        2, options, options_len);
+    uint8_t protocol[256];
+    int protocol_len = put_test_field_varint(
+        protocol, (int)sizeof(protocol), 1, 1); /* SEND_COMMAND_MESSAGE */
+    protocol_len += put_test_field_bytes(
+        protocol + protocol_len, (int)sizeof(protocol) - protocol_len,
+        6, command, command_len); /* sendCommandMessage extension */
+
+    uint8_t blob[300];
+    int blob_len = put_test_varint(blob, (int)sizeof(blob), protocol_len);
+    assert(blob_len + protocol_len <= (int)sizeof(blob));
+    memcpy(blob + blob_len, protocol, (size_t)protocol_len);
+    blob_len += protocol_len;
+
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "data", ap2_pl_data(blob, (size_t)blob_len));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "params", params);
+    uint8_t *plist = NULL;
+    int plist_len = ap2_pl_serialize(root, &plist);
+    ap2_pl_free(root);
+    assert(plist_len > 0 && plist);
+
+    uint8_t frame[1024] = {0};
+    uint32_t frame_size = 32u + (uint32_t)plist_len;
+    assert(frame_size <= sizeof(frame));
+    frame[0] = (uint8_t)(frame_size >> 24);
+    frame[1] = (uint8_t)(frame_size >> 16);
+    frame[2] = (uint8_t)(frame_size >> 8);
+    frame[3] = (uint8_t)frame_size;
+    memcpy(frame + 4, "sync", 4);
+    memcpy(frame + 16, "comm", 4);
+    for (int i = 0; i < 8; i++)
+        frame[20 + i] = (uint8_t)(seqno >> (56 - i * 8));
+    memcpy(frame + 32, plist, (size_t)plist_len);
+    free(plist);
+    assert((size_t)frame_size + 2 + TAG_SIZE <= encrypted_size);
+    return encrypt_frame(key, counter, frame, (int)frame_size, encrypted);
+}
+
 static void test_player_path_handshake(const uint8_t secret[KEY_SIZE])
 {
     int listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -312,6 +457,8 @@ static void test_player_path_handshake(const uint8_t secret[KEY_SIZE])
         "Music Assistant", "11111111-2222-4333-8444-555555555555",
         "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret, KEY_SIZE);
     assert(mrp);
+    struct event_capture events = {0};
+    ap2_mrp_set_remote_event_callback(mrp, capture_remote_event, &events);
     const uint64_t seed = 123456789;
     assert(ap2_mrp_attach(mrp, ntohs(address.sin_port), seed));
 
@@ -329,6 +476,9 @@ static void test_player_path_handshake(const uint8_t secret[KEY_SIZE])
     uint8_t output_key[KEY_SIZE];
     derive_key_with_salt(
         secret, salt, "DataStream-Output-Encryption-Key", output_key);
+    uint8_t input_key[KEY_SIZE];
+    derive_key_with_salt(
+        secret, salt, "DataStream-Input-Encryption-Key", input_key);
 
     uint8_t plain_stream[32768];
     int plain_stream_len = 0;
@@ -381,6 +531,20 @@ static void test_player_path_handshake(const uint8_t secret[KEY_SIZE])
     assert(contains_bytes(
         payloads[5], payload_lengths[5], player_id,
         (int)sizeof(player_id) - 1));
+
+    uint8_t command_frame[1200];
+    int command_frame_len = build_type130_seek_frame(
+        input_key, 0, 99, 77.25, command_frame, sizeof(command_frame));
+    assert(write(peer, command_frame, (size_t)command_frame_len) ==
+           command_frame_len);
+    for (int attempt = 0; attempt < 20 && events.count == 0; attempt++) {
+        ap2_mrp_tick(mrp);
+        if (events.count == 0) usleep(1000);
+    }
+    assert(events.count == 1);
+    assert(events.events[0].command == AP2_REMOTE_COMMAND_SEEK);
+    assert(events.events[0].has_position);
+    assert(fabs(events.events[0].position_seconds - 77.25) < 0.001);
 
     ap2_mrp_destroy(mrp);
     close(peer);
@@ -453,8 +617,10 @@ int main(void)
     assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO,
                       &timeout, sizeof(timeout)) == 0);
     struct command_capture capture = {0};
+    struct event_capture events = {0};
     struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
         secret, sockets[0], capture_remote_command, &capture);
+    ap2_mrp_set_remote_event_callback(mrp, capture_remote_event, &events);
 
     int saved_stderr = dup(STDERR_FILENO);
     FILE *log_capture = tmpfile();
@@ -533,6 +699,20 @@ int main(void)
     ap2_mrp_tick(mrp);
     read_response(sockets[1], sender_key, 11, 53);
 
+    encrypted_len = build_seek_request(
+        encrypted, sizeof(encrypted), receiver_key, 12, 54, 123.5);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 12, 54);
+
+    /* Native MediaRemote may omit the legacy value and carry only the numeric
+     * Play command. It must still reach the legacy callback surface. */
+    encrypted_len = build_modern_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 13, 55, 0);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 13, 55);
+
     static const ap2_remote_command_t expected_commands[] = {
         AP2_REMOTE_COMMAND_PLAY,
         AP2_REMOTE_COMMAND_PAUSE,
@@ -540,17 +720,23 @@ int main(void)
         AP2_REMOTE_COMMAND_NEXT,
         AP2_REMOTE_COMMAND_PREVIOUS,
         AP2_REMOTE_COMMAND_PLAY,
+        AP2_REMOTE_COMMAND_PLAY,
     };
     static const char *expected_names[] = {
-        "play", "pause", "play_pause", "next", "previous", "play",
+        "play", "pause", "play_pause", "next", "previous", "play", "play",
     };
-    assert(capture.count == 6);
+    assert(capture.count == 7);
     for (int i = 0; i < capture.count; i++) {
         assert(capture.commands[i] == expected_commands[i]);
         assert(strcmp(
                    ap2_remote_command_name(capture.commands[i]),
                    expected_names[i]) == 0);
     }
+    assert(events.count == 8);
+    assert(events.events[6].command == AP2_REMOTE_COMMAND_SEEK);
+    assert(events.events[6].has_position);
+    assert(fabs(events.events[6].position_seconds - 123.5) < 0.001);
+    assert(events.events[7].command == AP2_REMOTE_COMMAND_PLAY);
 
     fflush(stderr);
     test_log_level = lSILENCE;
@@ -570,6 +756,8 @@ int main(void)
     assert(strstr(logs, "type=sendMediaRemoteCommand value=play"));
     assert(strstr(logs, "body parse failed"));
     assert(strstr(logs, "content_length=4 hex=74657374"));
+    assert(strstr(logs, "modern=24 position=123.500"));
+    assert(strstr(logs, "modern=0"));
 
     ap2_mrp_destroy(mrp);
     close(sockets[1]);

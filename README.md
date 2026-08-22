@@ -311,6 +311,25 @@ the one-shot setup lines (`route`, `capabilities`, `latency`) plus
 remote-control events on stdout — so a parser has to read both. `DESIGN.md` §12
 lists every line, the stream it uses, and when it fires.
 
+For Apple MediaRemote sessions, the reverse event channel can also emit
+`[EVENT] remote seek=<seconds>`. This is the decoded target position; the
+caller must still perform the audio flush/refill and `START` operation before
+the new position is audible. The CLI does not guess a source-specific seek
+implementation from this event.
+
+The sender identity used in the MediaRemote registration is independent of the
+target speaker name. It defaults to `Music Assistant` with the historical
+`com.apple.Music` bundle profile. For a native macOS app comparison, set
+`CLIAIRPLAY_MEDIAREMOTE_SENDER_NAME` and
+`CLIAIRPLAY_MEDIAREMOTE_BUNDLE_IDENTIFIER` (for example,
+`me.elsanna.MusicBox`) and compare the receiver's active client/queue, not only
+the HTTP status. The type-130 custom PlayerPath also carries a generated
+non-zero origin identifier, matching Apple's serialized path shape.
+For a separate type-130 registration experiment, set
+`CLIAIRPLAY_MEDIAREMOTE_CLIENT_UPDATES=1` to request the observer-style artwork,
+volume, keyboard, and output-device update categories. It is off by default and
+does not change the proven main-session sender path.
+
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded
 start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
@@ -340,6 +359,14 @@ Unset switches use the defaults above. The older `CLIAIRPLAY_MRP*` and
 `CLIAIRPLAY_NOW_PLAYING_PROFILE` variables are no longer read. When no
 MediaRemote context is created, progress continues to use the existing legacy
 RTSP path automatically.
+While a native command-path session is streaming, the feedback worker also
+publishes a lean MediaRemote timeline update about every two seconds. It
+advances the elapsed value from the last timestamp locally, so steady playback
+does not depend on the caller sending a `PROGRESS` line. Pause, stop, and the
+experimental type-130 sidecar remain on their existing transition/state paths.
+When the optional complete-registration refresh is enabled, it re-anchors the
+same elapsed/timestamp pair before its replace push, so the refresh cannot
+rewind the displayed position.
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,

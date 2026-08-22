@@ -228,6 +228,55 @@ static bool bp_read_uint_ref(const bp_raw_view *view, uint64_t ref, uint64_t *ou
     return true;
 }
 
+static bool bp_read_real_ref(const bp_raw_view *view, uint64_t ref, double *out)
+{
+    if (!out) return false;
+    size_t pos = bp_view_obj_ofs(view, ref);
+    if (!pos || pos >= view->table_ofs ||
+        (view->data[pos] & 0xF0) != 0x20)
+        return false;
+
+    /* Real markers encode the byte width as 2^n directly in the low nibble;
+     * bp_read_count is for collection/int markers and deliberately treats
+     * those differently. */
+    size_t bytes = (size_t)1 << (view->data[pos] & 0x0F);
+    pos++;
+    if ((bytes != sizeof(float) && bytes != sizeof(double)) ||
+        pos + bytes > view->table_ofs)
+        return false;
+
+    uint64_t bits = bp_read_be(view->data + pos, bytes);
+    if (bytes == sizeof(float)) {
+        uint32_t raw = (uint32_t)bits;
+        float value;
+        memcpy(&value, &raw, sizeof(value));
+        *out = (double)value;
+    } else {
+        double value;
+        memcpy(&value, &bits, sizeof(value));
+        *out = value;
+    }
+    return true;
+}
+
+static bool bp_read_data_ref(const bp_raw_view *view, uint64_t ref,
+                             const uint8_t **data, size_t *len)
+{
+    if (!data || !len) return false;
+    size_t pos = bp_view_obj_ofs(view, ref);
+    if (!pos || pos >= view->table_ofs ||
+        (view->data[pos] & 0xF0) != 0x40)
+        return false;
+
+    size_t count;
+    if (!bp_read_count(view->data, view->table_ofs, &pos, &count) ||
+        pos + count > view->table_ofs)
+        return false;
+    *data = view->data + pos;
+    *len = count;
+    return true;
+}
+
 static bool bp_find_dict_child_ref(const bp_raw_view *view,
                                    const char *dict_key, const char *key,
                                    uint64_t *value_ref)
@@ -362,6 +411,48 @@ int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint6
         }
     }
     return 0;
+}
+
+int ap2_bplist_find_real(const uint8_t *data, size_t len, const char *key,
+                         double *out)
+{
+    if (!data || !key || !out) return 0;
+    bp_raw_view view;
+    if (!bp_view_init(data, len, &view)) return 0;
+
+    uint64_t value_ref;
+    if (!bp_find_value_ref(&view, key, &value_ref)) return 0;
+    if (bp_read_real_ref(&view, value_ref, out)) return 1;
+
+    uint64_t integer;
+    if (bp_read_uint_ref(&view, value_ref, &integer)) {
+        *out = (double)integer;
+        return 1;
+    }
+    return 0;
+}
+
+int ap2_bplist_find_data(const uint8_t *data, size_t len, const char *key,
+                         uint8_t **out, size_t *out_len)
+{
+    if (!data || !key || !out || !out_len) return 0;
+    *out = nullptr;
+    *out_len = 0;
+
+    bp_raw_view view;
+    if (!bp_view_init(data, len, &view)) return 0;
+    uint64_t value_ref;
+    if (!bp_find_value_ref(&view, key, &value_ref)) return 0;
+
+    const uint8_t *value;
+    size_t value_len;
+    if (!bp_read_data_ref(&view, value_ref, &value, &value_len)) return 0;
+    uint8_t *copy = (uint8_t *)malloc(value_len ? value_len : 1);
+    if (!copy) return 0;
+    if (value_len) memcpy(copy, value, value_len);
+    *out = copy;
+    *out_len = value_len;
+    return 1;
 }
 
 int ap2_bplist_find_dict_uint(const uint8_t *data, size_t len,

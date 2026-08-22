@@ -81,6 +81,11 @@ extern log_level *loglevel;
  * stopped reading altogether costs, and nothing waits on the answer. */
 #define AP2_RTSP_FAREWELL_TIMEOUT_MS 250
 #define AP2_FEEDBACK_INTERVAL_MS     2000
+/* Native AirPlaySender receives position changes from the MediaRemote
+ * controller while the item is playing. Reuse the existing feedback cadence
+ * for the command-path equivalent so a caller does not have to emit a
+ * PROGRESS line merely to keep Home's elapsed-time display moving. */
+#define AP2_MRP_TIMELINE_INTERVAL_MS AP2_FEEDBACK_INTERVAL_MS
 /* A single missed keepalive beat must not kill an otherwise healthy session:
  * receivers ride out multi-second local network blackouts (wifi roams, DFS
  * scans) with their buffered audio intact. Consecutive timeout-shaped misses
@@ -261,9 +266,12 @@ struct ap2cl_s {
     bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
                                      timeline pushes use the full replace */
     uint64_t mrp_last_full_refresh_ms;
+    uint64_t mrp_last_timeline_push_ms;
     int mrp_last_playback_state;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
+    ap2_remote_event_cb_t remote_event_cb;
+    void *remote_event_userdata;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -422,7 +430,9 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      bool force);
 static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
     struct ap2cl_s *p);
+static bool ap2cl_mrp_progress_if_due(struct ap2cl_s *p, uint64_t now_ms);
 static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p);
+static void ap2cl_mrp_flush_metadata(struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
@@ -436,6 +446,14 @@ static void ap2_remote_command_received(
     struct ap2cl_s *p = userdata;
     if (p && p->remote_command_cb)
         p->remote_command_cb(command, p->remote_command_userdata);
+}
+
+static void ap2_remote_event_received(const ap2_remote_event_t *event,
+                                      void *userdata)
+{
+    struct ap2cl_s *p = userdata;
+    if (p && p->remote_event_cb)
+        p->remote_event_cb(event, p->remote_event_userdata);
 }
 
 /* ---- Environment toggles ---- */
@@ -502,6 +520,23 @@ static bool ap2_mediaremote_periodic_refresh(void)
 static bool ap2_mediaremote_group_leader_only(void)
 {
     return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY", false);
+}
+
+static const char *ap2_mediaremote_bundle_identifier(void)
+{
+    const char *value = getenv("CLIAIRPLAY_MEDIAREMOTE_BUNDLE_IDENTIFIER");
+    return value && *value ? value : "com.apple.Music";
+}
+
+static const char *ap2_mediaremote_sender_name(void)
+{
+    const char *name = getenv("CLIAIRPLAY_MEDIAREMOTE_SENDER_NAME");
+    return name && *name ? name : "Music Assistant";
+}
+
+static bool ap2_mediaremote_client_updates(void)
+{
+    return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_CLIENT_UPDATES", false);
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -1613,13 +1648,16 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
      * channel (TCP connect + DEVICE_INFO-first handshake). */
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
-                                p->auth_credentials, p->dacp_id, p->device.name,
+                                p->auth_credentials, p->dacp_id,
+                                ap2_mediaremote_sender_name(),
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap),
                                 ap2_hap_get_shared_secret_len(p->hap));
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
+    ap2_mrp_set_remote_event_callback(
+        p->mrp, ap2_remote_event_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
@@ -1974,6 +2012,8 @@ static bool ap2_native_setup_mrp_sidecar(struct ap2cl_s *p)
     p->mrp_sidecar = side;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
+    ap2_mrp_set_remote_event_callback(
+        p->mrp, ap2_remote_event_received, p);
     LOG_INFO("[MRP] independent remote-control session established");
     return true;
 
@@ -3335,12 +3375,16 @@ struct ap2cl_s *ap2cl_create(
              p->flow == FLOW_NATIVE_AP2 ? "native AP2" : "RAOP-compat");
     LOG_INFO(
         "[AP2] Now Playing config: mediaremote=%d transient_apple=%d "
-        "dmap_extended=%d artwork_url=%d sidecar_datastream=%d "
+        "dmap_extended=%d artwork_url=%d sender_name=\"%s\" bundle_id=\"%s\" "
+        "client_updates=%d sidecar_datastream=%d "
         "sidecar_keep_main=%d main_refresh=%d leader_only=%d",
         ap2_mediaremote_enabled(),
         ap2_mediaremote_allow_transient_apple_sessions(),
         ap2_dmap_extended_metadata_enabled(),
         ap2_mediaremote_include_artwork_url(),
+        ap2_mediaremote_sender_name(),
+        ap2_mediaremote_bundle_identifier(),
+        ap2_mediaremote_client_updates(),
         ap2_mediaremote_sidecar_enabled(),
         ap2_mediaremote_sidecar_keep_main_session(),
         ap2_mediaremote_periodic_refresh(),
@@ -3540,6 +3584,14 @@ void ap2cl_set_remote_command_callback(
     p->remote_command_userdata = userdata;
 }
 
+void ap2cl_set_remote_event_callback(
+    struct ap2cl_s *p, ap2_remote_event_cb_t callback, void *userdata)
+{
+    if (!p) return;
+    p->remote_event_cb = callback;
+    p->remote_event_userdata = userdata;
+}
+
 ap2_connect_error_t ap2cl_connect_error(struct ap2cl_s *p, int *http_status,
                                         const char **detail)
 {
@@ -3595,8 +3647,13 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         ap2_feedback_stop(p);
         ap2_rtx_stop(p);
         /* Publish the final stopped state before disconnecting MediaRemote,
-         * while the encrypted RTSP session is still live. */
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
+         * while the encrypted RTSP session is still live. The main command
+         * path additionally flushes the item and supported commands in the
+         * native AirPlaySender order; the sidecar stays on SET_STATE. */
+        if (p->mrp_sidecar)
+            ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
+        else
+            ap2cl_mrp_flush_metadata(p);
         pthread_mutex_lock(&p->mrp_publish_lock);
         pthread_mutex_lock(&p->mrp_lock);
         struct ap2_mrp_ctx *mrp = p->mrp;
@@ -4985,6 +5042,7 @@ bool ap2cl_feedback(struct ap2cl_s *p)
             }
         }
         ap2cl_mrp_refresh_if_due(p);
+        ap2cl_mrp_progress_if_due(p, ap2_io_monotonic_ms());
     }
     if (result == AP2_FEEDBACK_SUCCEEDED) {
         unsigned prior_misses = atomic_exchange(&p->feedback_failures, 0);
@@ -5310,13 +5368,15 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
         return;
     if (!ap2_mediaremote_enabled()) return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
-                            p->dacp_id, p->device.name,
+                            p->dacp_id, ap2_mediaremote_sender_name(),
                             p->session_uuid, p->group_uuid,
                             ap2_hap_get_shared_secret(p->hap),
                             ap2_hap_get_shared_secret_len(p->hap));
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
+    ap2_mrp_set_remote_event_callback(
+        p->mrp, ap2_remote_event_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; MediaRemote disabled");
         ap2_mrp_destroy(p->mrp);
@@ -5553,6 +5613,79 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
     return ap2cl_mrp_push_serialized_with(p, ap2_mrp_build_nowplaying_command);
 }
 
+/* Mirror AirPlaySender's flushMetadata on a main-session command path. The
+ * type-130 sidecar has a separate owner and continues through its SET_STATE
+ * stopped path; sending this /command sequence there would mix transports. */
+static void ap2cl_mrp_flush_metadata(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
+        return;
+
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    pthread_mutex_lock(&p->mrp_lock);
+    struct ap2_mrp_ctx *mrp = p->mrp;
+    bool main_command_path = mrp && !ap2_mrp_channel_active(p);
+    if (main_command_path)
+        ap2_mrp_set_stopped(mrp);
+    pthread_mutex_unlock(&p->mrp_lock);
+
+    if (main_command_path) {
+        int clear_status = ap2_mrp_post_command(
+            p, ap2_mrp_build_clear_nowplaying_command,
+            "[MRP] /command flush now-playing");
+        int state_status = ap2_mrp_send_playback_state(
+            p, AP2_MRP_PLAYBACK_STOPPED, true);
+        int commands_status = ap2_mrp_post_command(
+            p, ap2_mrp_build_empty_supportedcommands_command,
+            "[MRP] /command flush supported commands");
+        LOG_INFO("[MRP] flush metadata: info=%d playback=%d commands=%d",
+                 clear_status, state_status, commands_status);
+    }
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+}
+
+/* Keep the main command-path timeline alive between caller-supplied PROGRESS
+ * updates. MusicBox does this through MPNowPlayingInfoCenter's periodic
+ * position observer; the CLI has no local MediaRemote controller, so the
+ * feedback worker is the stable clock available to it. This deliberately
+ * excludes the experimental type-130 sidecar: that path owns its own SET_STATE
+ * publication and must not receive a second transport's timeline. */
+static bool ap2cl_mrp_progress_if_due(struct ap2cl_s *p, uint64_t now_ms)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0 ||
+        p->mrp_sidecar || p->state != AP2_STREAMING ||
+        p->content_paused || p->content_stopped)
+        return false;
+    if (p->mrp_last_timeline_push_ms != 0 &&
+        now_ms - p->mrp_last_timeline_push_ms < AP2_MRP_TIMELINE_INTERVAL_MS)
+        return false;
+    if (pthread_mutex_trylock(&p->mrp_publish_lock) != 0)
+        return false;
+
+    pthread_mutex_lock(&p->mrp_lock);
+    ap2_mrp_playback_state_t state = ap2_mrp_current_playback_state(p);
+    bool ready = p->mrp != NULL && state == AP2_MRP_PLAYBACK_PLAYING;
+    if (ready)
+        /* set_playing advances elapsed from the previous timestamp before
+         * re-anchoring it, which is exactly the timestamp/position pair the
+         * receiver's MediaRemote timeline consumes. */
+        ap2_mrp_set_playing(p->mrp, true);
+    pthread_mutex_unlock(&p->mrp_lock);
+
+    bool pushed = false;
+    if (ready) {
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_progress_serialized(p);
+        pushed = ap2_mrp_status_ok(result.overall_status);
+        if (pushed) {
+            p->mrp_last_timeline_push_ms = now_ms;
+            LOG_DEBUG("[MRP] periodic timeline update completed (status=%d)",
+                      result.overall_status);
+        }
+    }
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return pushed;
+}
+
 /* Reassert the complete sender registration on the main audio session. This
  * is deliberately opt-in: it tests whether Home App drops an otherwise valid
  * sender after the initial push, without opening the known-unstable type-130
@@ -5582,6 +5715,13 @@ static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p)
      * context is not marked connected. The main RTSP session is the transport
      * owner in this mode; only exclude the separate type-130 path above. */
     bool ready = p->mrp != NULL;
+    if (ready && ap2_mrp_current_playback_state(p) ==
+                    AP2_MRP_PLAYBACK_PLAYING) {
+        /* A full replace is still a timeline publication. Advance and
+         * re-anchor before serializing it, otherwise the opt-in 15-second
+         * refresh can briefly rewind Home to the last caller-supplied value. */
+        ap2_mrp_set_playing(p->mrp, true);
+    }
     pthread_mutex_unlock(&p->mrp_lock);
     if (ready) {
         p->mrp_device_registered = false;
@@ -5589,6 +5729,7 @@ static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p)
         ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
         if (result.overall_status >= 200 && result.overall_status < 300) {
             p->mrp_last_full_refresh_ms = now;
+            p->mrp_last_timeline_push_ms = now;
             LOG_INFO("[MRP] command refresh completed (status=%d)",
                      result.overall_status);
         } else {
@@ -6077,6 +6218,21 @@ void ap2cl_test_lock_mrp(struct ap2cl_s *p)
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p)
 {
     pthread_mutex_unlock(&p->mrp_lock);
+}
+
+bool ap2cl_test_mrp_progress_if_due(struct ap2cl_s *p, uint64_t now_ms)
+{
+    return ap2cl_mrp_progress_if_due(p, now_ms);
+}
+
+void ap2cl_test_set_mrp_last_full_refresh_ms(struct ap2cl_s *p, uint64_t now_ms)
+{
+    p->mrp_last_full_refresh_ms = now_ms;
+}
+
+void ap2cl_test_mrp_refresh_if_due(struct ap2cl_s *p)
+{
+    ap2cl_mrp_refresh_if_due(p);
 }
 
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)

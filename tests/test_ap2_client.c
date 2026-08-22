@@ -30,6 +30,10 @@ log_level raop_loglevel = lSILENCE;
 void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m);
 void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
+bool ap2cl_test_mrp_progress_if_due(struct ap2cl_s *p, uint64_t now_ms);
+void ap2cl_test_set_mrp_last_full_refresh_ms(struct ap2cl_s *p,
+                                             uint64_t now_ms);
+void ap2cl_test_mrp_refresh_if_due(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
@@ -1712,6 +1716,201 @@ static void test_mrp_bundle_and_pause_publish(void)
     puts("ap2_client MRP bundle and pause publication tests passed");
 }
 
+/* The caller is allowed to stay quiet between metadata changes. The command
+ * path must still advance its MediaRemote timeline on the feedback cadence,
+ * while a second call inside that cadence must not create another POST. */
+static void test_mrp_periodic_timeline_publication(void)
+{
+    clear_now_playing_switches();
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    /* First due push: DEVICE_INFO + timeline + three extended registrations;
+     * second due push: one timeline update (playback state is unchanged). */
+    peer->expected_requests = 6;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "periodic timeline test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_session_state(client, AP2_STREAMING);
+
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "periodic sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
+    assert(mrp);
+    assert(ap2_mrp_set_metadata(mrp, "Track", "Artist", "Album", 180000,
+                                "item-1"));
+    ap2cl_test_set_mrp(client, mrp);
+
+    assert(ap2cl_test_mrp_progress_if_due(client, 1000));
+    assert(!ap2cl_test_mrp_progress_if_due(client, 1500));
+    assert(ap2cl_test_mrp_progress_if_due(client, 3000));
+    ap2cl_test_set_session_state(client, AP2_PAUSED);
+    assert(!ap2cl_test_mrp_progress_if_due(client, 5000));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok && peer->request_count == 6);
+    assert(request_has(&peer->requests[1], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[1], "mergePolicy"));
+    assert(request_has(&peer->requests[1],
+                       "kMRMediaRemoteNowPlayingInfoElapsedTime"));
+    assert(request_has(&peer->requests[5], "updateMRNowPlayingInfo"));
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client periodic MRP timeline publication tests passed");
+}
+
+/* Native AirPlaySender flushes the MediaRemote item and command list before
+ * closing its transport. The command-path client must leave the receiver with
+ * an empty now-playing item rather than only a stale Stopped state. */
+static void test_mrp_flushes_metadata_on_disconnect(void)
+{
+    clear_now_playing_switches();
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 4;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "flush metadata test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "flush sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
+    assert(mrp);
+    assert(ap2_mrp_set_metadata(mrp, "Track", "Artist", "Album", 180000,
+                                "item-1"));
+    ap2cl_test_set_mrp(client, mrp);
+
+    assert(ap2cl_disconnect(client));
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok && peer->request_count == 4);
+    assert(strcmp(peer->requests[0].method, "POST") == 0);
+    assert(request_has(&peer->requests[0], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[0], "replace"));
+    assert(!request_has(&peer->requests[0],
+                        "kMRMediaRemoteNowPlayingInfoTitle"));
+    assert(request_has(&peer->requests[1], "updateMRPlaybackState"));
+    assert(request_has(&peer->requests[2], "updateMRSupportedCommands"));
+    assert(!request_has(&peer->requests[2], "kCommandInfoCommandKey"));
+    assert(strcmp(peer->requests[3].method, "TEARDOWN") == 0);
+
+    close(sockets[1]);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client MRP disconnect flush tests passed");
+}
+
+/* The opt-in full refresh uses a replace body, so it must advance the same
+ * elapsed/timestamp pair as the lean cadence instead of re-sending a stale
+ * caller snapshot. */
+static void test_mrp_full_refresh_reanchors_timeline(void)
+{
+    clear_now_playing_switches();
+    assert(setenv("CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH",
+                  "1", 1) == 0);
+
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 5;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "full refresh timeline test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_session_state(client, AP2_STREAMING);
+
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "refresh sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
+    assert(mrp);
+    assert(ap2_mrp_set_metadata(mrp, "Track", "Artist", "Album", 180000,
+                                "item-1"));
+    assert(ap2_mrp_set_playing(mrp, true));
+    ap2cl_test_set_mrp(client, mrp);
+    usleep(10000);
+
+    uint64_t now = ap2_io_monotonic_ms();
+    assert(now > 15000);
+    ap2cl_test_set_mrp_last_full_refresh_ms(client, now - 15000);
+    ap2cl_test_mrp_refresh_if_due(client);
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok && peer->request_count == 5);
+    assert(request_has(&peer->requests[1], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[1], "replace"));
+    assert(request_has(&peer->requests[1],
+                       "kMRMediaRemoteNowPlayingInfoElapsedTime"));
+    assert(!bplist_contains_zero_real(peer->requests[1].body,
+                                      (size_t)peer->requests[1].body_len));
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    assert(unsetenv("CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH") == 0);
+    puts("ap2_client full-refresh timeline re-anchor test passed");
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -2527,6 +2726,9 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
+    test_mrp_periodic_timeline_publication();
+    test_mrp_flushes_metadata_on_disconnect();
+    test_mrp_full_refresh_reanchors_timeline();
     test_minimal_dmap_metadata_switch();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();

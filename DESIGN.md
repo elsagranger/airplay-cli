@@ -655,6 +655,17 @@ each wire change can be tested without an implicit profile bundle:
   re-sends the complete main-session registration every 15 seconds.
 - `CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY` (default `0`) limits MediaRemote
   publication in a synchronized group to its leader.
+- `CLIAIRPLAY_MEDIAREMOTE_SENDER_NAME` (default `Music Assistant`) controls the
+  sender/client display name; it is deliberately separate from the target
+  speaker's `--name`.
+- `CLIAIRPLAY_MEDIAREMOTE_BUNDLE_IDENTIFIER` (default `com.apple.Music`)
+  controls the bundle identifier carried in the MRP device/client records. Set
+  it to a native app bundle such as `me.elsanna.MusicBox` only for an isolated
+  identity comparison.
+- `CLIAIRPLAY_MEDIAREMOTE_CLIENT_UPDATES` (default `0`) enables the type-130
+  observer-style `CLIENT_UPDATES_CONFIG` profile (artwork, volume, keyboard,
+  and output-device updates; now-playing updates remain off). It is an
+  experimental registration A/B, not part of the main sender path.
 
 When MediaRemote is not created, progress automatically uses the existing
 legacy RTSP path. The former `CLIAIRPLAY_NOW_PLAYING_PROFILE` and `CLIAIRPLAY_MRP*`
@@ -690,20 +701,28 @@ connect emits the initial sequence from AirPlaySender's
    representation the receiver expects.
 
 Playback state is re-sent on every start/pause/resume/stop and now-playing on
-every metadata/progress/artwork change — all caller-driven; nothing on this
-path is pushed on a timer. Progress itself is never streamed — the receiver
-extrapolates position from `ElapsedTime` + `Timestamp` + `PlaybackRate`, so a
-steady state needs no push. That same extrapolation is why pause and resume
-each push a timeline update (the `mergePolicy: "update"` shape below) before
-their `updateMRPlaybackState`, matching the Apple sender's info-then-state
-order: a bare state flip leaves the receiver showing the last literal
-`ElapsedTime` it was sent (usually the track start) on pause, and
-extrapolating across the paused wall-time span on resume. The frozen/resumed
-elapsed with a fresh `Timestamp` pins both transitions; teardown (stop) stays
-state-only. A receiver demoted to full replace pushes (update-policy
-rejection, below) gets the artwork-bearing replace shape at pause/resume too:
-the correct frozen elapsed is judged worth the re-render on such receivers,
-none of which have been observed in practice. The ~15 s defensive state
+every metadata/progress/artwork change. While the main command-path session is
+streaming, the feedback worker additionally emits a lean timeline update about
+every two seconds. This mirrors the periodic position changes that Apple's
+`MRNowPlayingController` receives from `MPNowPlayingInfoCenter`, and keeps the
+Home elapsed display moving even when the caller sends no `PROGRESS` line.
+The update advances the stored elapsed value and re-anchors `Timestamp` under
+the publication lock; it is skipped while paused/stopped and is not mixed into
+the experimental type-130 sidecar.
+The optional 15-second complete-registration refresh applies the same
+re-anchoring before its replace body, preventing a stale refresh from moving
+the displayed position backwards.
+
+The receiver still extrapolates between updates from `ElapsedTime` + `Timestamp`
+and `PlaybackRate`. That same extrapolation is why pause and resume each push a
+timeline update (the `mergePolicy: "update"` shape below) before their
+`updateMRPlaybackState`, matching the Apple sender's info-then-state order: a
+bare state flip leaves the receiver showing the last literal `ElapsedTime` it
+was sent (usually the track start) on pause, and extrapolating across the
+paused wall-time span on resume. The frozen/resumed elapsed with a fresh
+`Timestamp` pins both transitions; teardown (stop) stays state-only. A receiver
+demoted to full replace pushes (update-policy rejection, below) gets the
+artwork-bearing replace shape at pause/resume too. The ~15 s defensive state
 re-push belongs to the type-130 channel below.
 
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
@@ -859,6 +878,10 @@ serialized command-info bplist (`kCommandInfoCommandKey` / `EnabledKey` /
 identifiers use MRMediaRemoteCommand numbering, which is not pyatv's `Command`
 enum** — the two enumerations disagree, so the wire values here
 (0,1,2,3,4,5,8,9,10,11,17,18,24,25,26) are Apple's, not pyatv's.
+The sender advertises command `24` (`SeekToPlaybackPosition`) as enabled and
+scrubbable, with `SupportsReferencePosition=false`, matching the native Mac
+sender. The separate type-130 protobuf enum uses value `45` for the same
+operation; do not interchange these numbers.
 
 **Type-130 now-playing and remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
@@ -884,9 +907,22 @@ picture and the sender does not also publish `/command` or legacy DMAP
 metadata. The feedback worker re-pushes it every 15 s
 (`MRP_STATE_REPUSH_S`) as a defensive refresh. That push is skipped while the
 channel is down, which is why the default path has no periodic state refresh.
+This PlayerPath is an experimental type-130 sender shape, not the native
+AirPlaySender path: Apple's sender constructs a local `MRDestination` and sends
+metadata through the main session's `TransportControlStream`; its custom-origin
+protobuf also carries a generated origin identifier. Keep the sidecar disabled
+when comparing the proven command-only path until a receiver-side active-player
+association is observed.
 `src/ap2_mrp.c` hand-rolls the proto2 emitters, the `/command` builders, the
 bplist `params.data` wrapper, the DataStream key derivation and channel
-framing, and answers inbound `sync` frames with `rply`.
+framing. Inbound `SEND_COMMAND_MESSAGE` frames are decoded for
+play/pause/toggle/next/previous and `SeekToPlaybackPosition` (type-130 command
+45, `CommandOptions.playbackPosition` field 9), emitted through the same event
+callbacks, and acknowledged with `rply`. This completes the command transport;
+it does not make the experimental sidecar the receiver's active audio player.
+The main event parser accepts both the legacy four-character `value` and the
+numeric `modernMediaRemoteCommand` form. The custom type-130 `Origin` includes
+a generated non-zero identifier, matching Apple's serialized path shape.
 
 ## 9. Buffered audio (type 103)
 
@@ -1188,6 +1224,7 @@ verbosity, never its stream.
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
 | `[EVENT] remote command=` | stdout | device-originated remote-control press |
+| `[EVENT] remote seek=<seconds>` | stdout | decoded MediaRemote seek target from the reverse event channel |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

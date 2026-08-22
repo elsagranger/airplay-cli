@@ -61,6 +61,17 @@ const uint8_t *ap2_bplist_get_data(struct ap2_bplist *bp, const char *key, size_
  */
 int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out);
 
+/* Find a real (or integer, promoted to double) value by key anywhere in a
+ * raw binary plist. Used for MediaRemote command options such as
+ * kMRMediaRemoteOptionPlaybackPosition. */
+int ap2_bplist_find_real(const uint8_t *data, size_t len, const char *key,
+                         double *out);
+
+/* Find a data object by key anywhere in a raw binary plist. The returned copy
+ * belongs to the caller and must be freed with free(). */
+int ap2_bplist_find_data(const uint8_t *data, size_t len, const char *key,
+                         uint8_t **out, size_t *out_len);
+
 /*
  * Find an integer child inside a named dictionary, e.g.
  * supportedFormats.bufferStream.

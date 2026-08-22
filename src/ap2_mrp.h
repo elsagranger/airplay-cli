@@ -32,6 +32,10 @@ struct ap2_mrp_ctx;
 void ap2_mrp_set_remote_command_callback(
     struct ap2_mrp_ctx *m, ap2_remote_command_cb_t callback, void *userdata);
 
+/* Receive the richer event form, including a target position for seek. */
+void ap2_mrp_set_remote_event_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_event_cb_t callback, void *userdata);
+
 typedef enum {
     AP2_MRP_PLAYBACK_PLAYING = 1,
     AP2_MRP_PLAYBACK_PAUSED = 2,
@@ -292,6 +296,11 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
+/* Build the native teardown shape: an empty npi-text replace, used to flush
+ * the receiver's stale Now Playing item before the RTSP session closes. */
+bool ap2_mrp_build_clear_nowplaying_command(struct ap2_mrp_ctx *m,
+                                            uint8_t **out, int *out_len);
+
 /* Build the now-playing body for a pure timeline correction (seek): a
  * mergePolicy "update" push carrying only the timeline fields, so the
  * receiver keeps its artwork untouched (a replace push without the bytes
@@ -312,6 +321,10 @@ bool ap2_mrp_build_deviceinfo_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
                                              uint8_t **out, int *out_len);
+
+/* Build an empty updateMRSupportedCommands body for the native flush path. */
+bool ap2_mrp_build_empty_supportedcommands_command(
+    struct ap2_mrp_ctx *m, uint8_t **out, int *out_len);
 
 /*
  * Build the remaining MediaRemote extended-metadata commands sent by Apple's

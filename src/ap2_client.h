@@ -532,6 +532,11 @@ void ap2cl_format_capabilities(struct ap2cl_s *p,
 void ap2cl_set_remote_command_callback(
     struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata);
 
+/* Set the richer reverse-event callback. In addition to legacy transport
+ * commands it reports a decoded MediaRemote seek target when available. */
+void ap2cl_set_remote_event_callback(
+    struct ap2cl_s *p, ap2_remote_event_cb_t callback, void *userdata);
+
 /*
  * Get the effective playback lead and the receiver-reported buffering window.
  *
