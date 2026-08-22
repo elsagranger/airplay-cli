@@ -316,14 +316,30 @@ metadata; the binary pushes an initial metadata set at the first commanded
 start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
-`CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
-Set `CLIAIRPLAY_NOW_PLAYING_PROFILE=original` to retain the current audio,
-stereo-group, PTP, and lifecycle implementation while reproducing the v0.5.2
-default Now Playing path: MRP is auth-credentials-only, native DMAP uses the
-original `mikd`/title/artist/album/track-number payload, progress uses the
-legacy `SET_PARAMETER` path when MRP is absent, and the later artwork-URL,
-type-130, dual, refresh, and leader-only experiments are disabled. The default
-profile remains the current implementation.
+`CLIAIRPLAY_MEDIAREMOTE_ENABLED=0` only to disable that path for comparison or
+diagnosis. The Now Playing behavior is controlled by independent switches:
+
+- `CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS` (default `1`) allows
+  Apple-model sessions without stored credentials to use MediaRemote.
+- `CLIAIRPLAY_DMAP_EXTENDED_METADATA` (default `1`) selects the extended DMAP
+  fields; `0` sends the minimal v0.5.2-compatible field set.
+- `CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL` (default `1`) includes a
+  receiver-reachable artwork URL in the MediaRemote item. It does not disable
+  the separate JPEG upload.
+- `CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM` (default `0`) enables the
+  experimental type-130 DataStream sidecar.
+- `CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION` (default `0`)
+  also sends `/command`, DMAP, and artwork on the main audio session when the
+  sidecar is active.
+- `CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH` (default `0`)
+  re-sends the complete main-session registration every 15 seconds.
+- `CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY` (default `0`) limits MediaRemote
+  publication in a synchronized group to the leader.
+
+Unset switches use the defaults above. The older `CLIAIRPLAY_MRP*` and
+`CLIAIRPLAY_NOW_PLAYING_PROFILE` variables are no longer read. When no
+MediaRemote context is created, progress continues to use the existing legacy
+RTSP path automatically.
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,

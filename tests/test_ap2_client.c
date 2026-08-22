@@ -56,11 +56,14 @@ bool ap2cl_test_mrp_session_eligible(bool native, bool authenticated, bool apple
 bool ap2cl_test_mrp_group_publisher(const char *device_address,
                                     const char *leader_address,
                                     size_t peer_count);
-bool ap2cl_test_env_enabled(const char *name, bool unset_default);
-bool ap2cl_test_original_now_playing_profile(void);
-bool ap2cl_test_mrp_type130_enabled(void);
-bool ap2cl_test_mrp_refresh_enabled(void);
-bool ap2cl_test_mrp_leader_only_enabled(void);
+bool ap2cl_test_mediaremote_enabled(void);
+bool ap2cl_test_mediaremote_allow_transient_apple_sessions(void);
+bool ap2cl_test_dmap_extended_metadata_enabled(void);
+bool ap2cl_test_mediaremote_include_artwork_url(void);
+bool ap2cl_test_mediaremote_sidecar_enabled(void);
+bool ap2cl_test_mediaremote_sidecar_keep_main_session(void);
+bool ap2cl_test_mediaremote_periodic_refresh(void);
+bool ap2cl_test_mediaremote_group_leader_only(void);
 bool ap2cl_test_mrp_dmap_enabled(bool channel_active);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
@@ -774,80 +777,118 @@ static void test_auth_error_kind(void)
     puts("ap2_client auth error classification tests passed");
 }
 
-/* Both MediaRemote toggles parse their value, so the spellings a user reaches
- * for to switch something off do that from either default — the /command path
- * that ships on, and the type-130 channel that ships off. */
-static void test_env_toggle_parsing(void)
+static const char *const NOW_PLAYING_SWITCHES[] = {
+    "CLIAIRPLAY_MEDIAREMOTE_ENABLED",
+    "CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS",
+    "CLIAIRPLAY_DMAP_EXTENDED_METADATA",
+    "CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL",
+    "CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM",
+    "CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION",
+    "CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH",
+    "CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY",
+};
+
+static void clear_now_playing_switches(void)
+{
+    for (size_t i = 0; i < sizeof(NOW_PLAYING_SWITCHES) /
+                              sizeof(NOW_PLAYING_SWITCHES[0]); i++)
+        assert(unsetenv(NOW_PLAYING_SWITCHES[i]) == 0);
+}
+
+static void test_now_playing_switch_defaults_and_parsing(void)
 {
     static const char *const off[] = { "0", "false", "off" };
     static const char *const on[] = { "1", "yes", "" };
 
-    /* Unset keeps each toggle's own default: /command on, type-130 off. */
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
-    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
-    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
-    assert(ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
-    assert(!ap2cl_test_mrp_type130_enabled());
+    clear_now_playing_switches();
+    assert(ap2cl_test_mediaremote_enabled());
+    assert(ap2cl_test_mediaremote_allow_transient_apple_sessions());
+    assert(ap2cl_test_dmap_extended_metadata_enabled());
+    assert(ap2cl_test_mediaremote_include_artwork_url());
+    assert(!ap2cl_test_mediaremote_sidecar_enabled());
+    assert(!ap2cl_test_mediaremote_sidecar_keep_main_session());
+    assert(!ap2cl_test_mediaremote_periodic_refresh());
+    assert(!ap2cl_test_mediaremote_group_leader_only());
 
     for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
-        assert(setenv("CLIAIRPLAY_MRP", off[i], 1) == 0);
-        assert(setenv("CLIAIRPLAY_MRP_TYPE130", off[i], 1) == 0);
-        assert(!ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
-        assert(!ap2cl_test_mrp_type130_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ENABLED", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS",
+                      off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_allow_transient_apple_sessions());
+        assert(setenv("CLIAIRPLAY_DMAP_EXTENDED_METADATA", off[i], 1) == 0);
+        assert(!ap2cl_test_dmap_extended_metadata_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_include_artwork_url());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_periodic_refresh());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_group_leader_only());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_sidecar_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION", off[i], 1) == 0);
+        assert(!ap2cl_test_mediaremote_sidecar_keep_main_session());
     }
-    /* The documented CLIAIRPLAY_MRP_TYPE130=1 spelling enables (DESIGN.md §8),
-     * and no other value is read as off. */
     for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
-        assert(setenv("CLIAIRPLAY_MRP", on[i], 1) == 0);
-        assert(setenv("CLIAIRPLAY_MRP_TYPE130", on[i], 1) == 0);
-        assert(ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
-        assert(ap2cl_test_mrp_type130_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ENABLED", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_allow_transient_apple_sessions());
+        assert(setenv("CLIAIRPLAY_DMAP_EXTENDED_METADATA", on[i], 1) == 0);
+        assert(ap2cl_test_dmap_extended_metadata_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_include_artwork_url());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_periodic_refresh());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_group_leader_only());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_sidecar_enabled());
+        assert(setenv("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION", on[i], 1) == 0);
+        assert(ap2cl_test_mediaremote_sidecar_keep_main_session());
     }
-    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
-    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
-    puts("ap2_client env toggle parsing tests passed");
+    clear_now_playing_switches();
+    puts("ap2_client Now Playing switch defaults/parsing tests passed");
 }
 
-static void test_original_now_playing_profile_toggles(void)
+static void test_old_now_playing_switches_are_ignored(void)
 {
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
-    assert(!ap2cl_test_original_now_playing_profile());
-
+    clear_now_playing_switches();
     assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP", "0", 1) == 0);
     assert(setenv("CLIAIRPLAY_MRP_TYPE130", "1", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MRP_TYPE130_DUAL", "1", 1) == 0);
     assert(setenv("CLIAIRPLAY_MRP_REFRESH", "1", 1) == 0);
     assert(setenv("CLIAIRPLAY_MRP_LEADER_ONLY", "1", 1) == 0);
-    assert(ap2cl_test_original_now_playing_profile());
-    assert(!ap2cl_test_mrp_type130_enabled());
-    assert(!ap2cl_test_mrp_refresh_enabled());
-    assert(!ap2cl_test_mrp_leader_only_enabled());
-
-    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "current", 1) == 0);
-    assert(!ap2cl_test_original_now_playing_profile());
-    assert(ap2cl_test_mrp_type130_enabled());
-    assert(ap2cl_test_mrp_refresh_enabled());
-    assert(ap2cl_test_mrp_leader_only_enabled());
-
+    assert(ap2cl_test_mediaremote_enabled());
+    assert(ap2cl_test_mediaremote_allow_transient_apple_sessions());
+    assert(ap2cl_test_dmap_extended_metadata_enabled());
+    assert(!ap2cl_test_mediaremote_sidecar_enabled());
+    assert(!ap2cl_test_mediaremote_sidecar_keep_main_session());
+    assert(!ap2cl_test_mediaremote_periodic_refresh());
+    assert(!ap2cl_test_mediaremote_group_leader_only());
     assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP_REFRESH") == 0);
     assert(unsetenv("CLIAIRPLAY_MRP_LEADER_ONLY") == 0);
-    puts("ap2_client original Now Playing profile toggle tests passed");
+    puts("ap2_client old Now Playing switches ignored test passed");
 }
 
-static void test_mrp_type130_dual_keeps_dmap(void)
+static void test_now_playing_sidecar_keeps_dmap_switch(void)
 {
-    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
+    clear_now_playing_switches();
     assert(ap2cl_test_mrp_dmap_enabled(false));
     assert(!ap2cl_test_mrp_dmap_enabled(true));
 
-    assert(setenv("CLIAIRPLAY_MRP_TYPE130_DUAL", "1", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION",
+                  "1", 1) == 0);
     assert(ap2cl_test_mrp_dmap_enabled(false));
     assert(ap2cl_test_mrp_dmap_enabled(true));
 
-    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130_DUAL") == 0);
-    puts("ap2_client MRP type-130 dual DMAP tests passed");
+    clear_now_playing_switches();
+    puts("ap2_client sidecar main-session publication switch test passed");
 }
 
 /* The splice timeline is the default for every native session; the deny-list
@@ -1394,10 +1435,10 @@ static bool request_has(const command_peer_request_t *req, const char *needle)
     return bytes_contain_string(req->body, (size_t)req->body_len, needle);
 }
 
-static void test_original_now_playing_profile_dmap(void)
+static void test_minimal_dmap_metadata_switch(void)
 {
-    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
-    assert(setenv("CLIAIRPLAY_MRP", "0", 1) == 0);
+    assert(setenv("CLIAIRPLAY_DMAP_EXTENDED_METADATA", "0", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ENABLED", "0", 1) == 0);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -1409,7 +1450,7 @@ static void test_original_now_playing_profile_dmap(void)
     assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
 
     ap2_device_info_t device = {
-        .name = "original profile test",
+        .name = "minimal DMAP test",
         .address = "127.0.0.1",
         .port = 7000,
     };
@@ -1452,9 +1493,9 @@ static void test_original_now_playing_profile_dmap(void)
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
     free(peer);
-    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
-    puts("ap2_client original Now Playing DMAP profile tests passed");
+    assert(unsetenv("CLIAIRPLAY_MEDIAREMOTE_ENABLED") == 0);
+    assert(unsetenv("CLIAIRPLAY_DMAP_EXTENDED_METADATA") == 0);
+    puts("ap2_client minimal DMAP metadata switch tests passed");
 }
 
 /* MediaRemote publication over a scripted RTSP peer: the track bundle reaches
@@ -1852,29 +1893,30 @@ static void test_apple_model_resolution(void)
 
 static void test_mrp_session_eligibility(void)
 {
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    clear_now_playing_switches();
     assert(ap2cl_test_mrp_session_eligible(true, true, false));
     assert(ap2cl_test_mrp_session_eligible(true, false, true));
     assert(!ap2cl_test_mrp_session_eligible(true, false, false));
     assert(!ap2cl_test_mrp_session_eligible(false, true, true));
 
-    assert(setenv("CLIAIRPLAY_NOW_PLAYING_PROFILE", "original", 1) == 0);
+    assert(setenv("CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS",
+                  "0", 1) == 0);
     assert(ap2cl_test_mrp_session_eligible(true, true, false));
     assert(!ap2cl_test_mrp_session_eligible(true, false, true));
     assert(!ap2cl_test_mrp_session_eligible(true, false, false));
     assert(!ap2cl_test_mrp_session_eligible(false, true, true));
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
+    clear_now_playing_switches();
     puts("ap2_client MRP session eligibility tests passed");
 }
 
 static void test_mrp_group_leader_only(void)
 {
-    assert(unsetenv("CLIAIRPLAY_NOW_PLAYING_PROFILE") == 0);
-    assert(setenv("CLIAIRPLAY_MRP_LEADER_ONLY", "1", 1) == 0);
+    clear_now_playing_switches();
+    assert(setenv("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY", "1", 1) == 0);
     assert(ap2cl_test_mrp_group_publisher("192.0.2.1", "192.0.2.1", 2));
     assert(!ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 2));
     assert(ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 1));
-    assert(unsetenv("CLIAIRPLAY_MRP_LEADER_ONLY") == 0);
+    assert(unsetenv("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY") == 0);
     assert(ap2cl_test_mrp_group_publisher("192.0.2.2", "192.0.2.1", 2));
     puts("ap2_client MRP group leader-only tests passed");
 }
@@ -2476,16 +2518,16 @@ int main(void)
     test_native_flush_rejects_receiver_error();
     test_native_group_setpeers_uri();
     test_native_realtime_dscp_ef();
-    test_env_toggle_parsing();
-    test_original_now_playing_profile_toggles();
-    test_mrp_type130_dual_keeps_dmap();
+    test_now_playing_switch_defaults_and_parsing();
+    test_old_now_playing_switches_are_ignored();
+    test_now_playing_sidecar_keeps_dmap_switch();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();
     test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
-    test_original_now_playing_profile_dmap();
+    test_minimal_dmap_metadata_switch();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();

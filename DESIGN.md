@@ -608,7 +608,7 @@ now-playing session, not raw RTP flow, as playback activity. The path is gated
 to pair-verified native sessions or receivers whose advertised model identifies
 them as Apple hardware. Transient-paired third-party receivers neither need nor
 receive it.
-`CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
+`CLIAIRPLAY_MEDIAREMOTE_ENABLED=0` disables the whole path (diagnostic opt-out).
 
 **PIN requirement.** Type-130 itself is not PIN-gated. Its DataStream keys come
 from the HAP secret of the enclosing AirPlay RTSP session. Apple TV commonly
@@ -635,24 +635,38 @@ therefore “transient” alone does not identify whether a PIN-like SRP secret 
 used. This distinction affects HAP pair-setup only; it does not add a PIN step to
 type-130.
 
-`CLIAIRPLAY_NOW_PLAYING_PROFILE=original` is a process-wide compatibility
-profile for controlled HomePod A/B tests. It keeps the current transport,
-stereo-group, PTP, and lifecycle code, but restores the v0.5.2 default metadata
-boundary: only sessions with stored auth credentials are eligible for MRP,
-native DMAP uses the original small payload, and progress falls back to legacy
-`SET_PARAMETER` when MRP is absent. The profile also suppresses artwork URL,
-type-130/dual publication, command refresh, and leader-only filtering even if
-their individual environment toggles are enabled. Unset values and `current`
-retain the current implementation.
+The Now Playing behavior is controlled by independent environment switches so
+each wire change can be tested without an implicit profile bundle:
+
+- `CLIAIRPLAY_MEDIAREMOTE_ENABLED` (default `1`) enables MediaRemote metadata
+  and reverse event control; DMAP remains available when it is disabled.
+- `CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS` (default `1`)
+  allows Apple-model sessions without stored credentials to use MediaRemote.
+- `CLIAIRPLAY_DMAP_EXTENDED_METADATA` (default `1`) selects the extended DMAP
+  payload; `0` selects the minimal v0.5.2-compatible payload.
+- `CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL` (default `1`) includes the
+  receiver-reachable URL in the MediaRemote item, independently of JPEG bytes.
+- `CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM` (default `0`) enables the
+  experimental type-130 DataStream sidecar.
+- `CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION` (default `0`)
+  also publishes `/command`, DMAP, and artwork on the main audio session while
+  the sidecar is active.
+- `CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH` (default `0`)
+  re-sends the complete main-session registration every 15 seconds.
+- `CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY` (default `0`) limits MediaRemote
+  publication in a synchronized group to its leader.
+
+When MediaRemote is not created, progress automatically uses the existing
+legacy RTSP path. The former `CLIAIRPLAY_NOW_PLAYING_PROFILE` and `CLIAIRPLAY_MRP*`
+variables are no longer read.
 
 Some receiver firmware may require legacy MediaRemote registration messages
-before Home exposes a session as controllable. `CLIAIRPLAY_MRP_TYPE130_DUAL=1`
-is therefore retained as an explicit A/B switch that keeps the type-130
-`SET_STATE` stream while also sending `/command` registration and now-playing
-updates. It is **not** the default HomePod fix: the current stereo test mixed
-the sidecar context with the main RTSP owner, destabilized audio, and still did
-not create a durable Home App card. Leave it unset unless a clean, single-variable
-test proves a receiver needs it.
+before Home exposes a session as controllable. Set
+`CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION=1` to keep the
+type-130 `SET_STATE` stream while also sending main-session registration and
+now-playing updates. It is **not** the default HomePod fix: the stereo test
+mixed the sidecar context with the main RTSP owner, destabilized audio, and still
+did not create a durable Home App card.
 
 **Transport — `POST /command`** on the main encrypted RTSP channel (same
 channel and HAP framing as `/feedback`), `Content-Type:
@@ -660,7 +674,8 @@ application/x-apple-binary-plist`. This is the compatibility transport used
 when the type-130 channel is unavailable. When type-130 is connected, the same
 state is sent as encrypted `SET_STATE` protobufs instead, and the sender skips
 the duplicate `/command` and legacy DMAP metadata writes unless
-`CLIAIRPLAY_MRP_TYPE130_DUAL=1` is enabled. On the command path,
+`CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION=1` is enabled.
+On the command path,
 connect emits the initial sequence from AirPlaySender's
 `metadataSender_sendInitialMetadataInternal`:
 
@@ -857,8 +872,9 @@ observation, while the current HomePod sender experiment still reports
 an experimental result that must be verified on the receiver.
 The HAP secret input is 32 bytes for pair-verify credentials and the full
 64-byte SRP session key for transient PIN pairing. It is off by default for
-compatibility; `CLIAIRPLAY_MRP_TYPE130=1` enables it. Its value is parsed the
-same way as `CLIAIRPLAY_MRP`, so `0`/`false`/`off` keep it off. Once the channel
+compatibility; `CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM=1` enables it. Its
+value is parsed the same way as the other boolean switches, so
+`0`/`false`/`off` keep it off. Once the channel
 is up, the opening sequence selects `com.apple.Music` with
 `SET_NOW_PLAYING_CLIENT`, selects its stable `MediaRemote-DefaultPlayer` with
 `SET_NOW_PLAYING_PLAYER`, and sends the same complete `PlayerPath` in every
@@ -1093,7 +1109,8 @@ deny-list entry, not a policy retreat.
   DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
   commands, explicit playback state, and a serialized NowPlayingClient.
   Start/pause/resume/stop transitions stay synchronized with the audio state.
-  This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
+  This path is enabled by default
+  (`CLIAIRPLAY_MEDIAREMOTE_ENABLED=0` is the diagnostic opt-out);
   mutable state is snapshotted under a short lock, while RTSP/DataStream I/O
   runs afterward under a separate publication serializer. The feedback worker
   is the sole DataStream state sender, and realtime health reads an atomic event

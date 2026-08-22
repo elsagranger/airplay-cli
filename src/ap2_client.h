@@ -445,9 +445,9 @@ bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
 
 /* Push the current now-playing state and any pending MediaRemote extended
- * metadata over POST /command. Enabled for pair-verified native sessions;
- * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
- * failure, or -1 when the push does not apply to this session. */
+ * metadata over POST /command. Enabled for eligible native sessions;
+ * CLIAIRPLAY_MEDIAREMOTE_ENABLED=0 disables it. Returns the HTTP status, 0 on
+ * registration failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
 /* Same, but with the timeline-correction body shape (see

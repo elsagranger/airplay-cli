@@ -453,43 +453,55 @@ static bool ap2_env_enabled(const char *name, bool unset_default)
     return true;
 }
 
-/* Preserve the current audio/group implementation while reproducing the
- * v0.5.2 default Now Playing path. This profile is intentionally process-wide:
- * every stream in one MA instance must publish the same metadata shape. */
-static bool ap2_original_now_playing_profile(void)
+/* Now Playing switches are deliberately independent. The old profile
+ * variable bundled several unrelated experiments and made the effective wire
+ * behavior impossible to infer from the environment. */
+static bool ap2_mediaremote_enabled(void)
 {
-    const char *profile = getenv("CLIAIRPLAY_NOW_PLAYING_PROFILE");
-    return profile && strcmp(profile, "original") == 0;
+    return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_ENABLED", true);
 }
 
-/* Single answer for the opt-in type-130 channel: the setup site and the
- * [STATUS] reporter must agree, or the status line reports on a channel that
- * was never set up. */
-static bool ap2_mrp_type130_enabled(void)
+static bool ap2_mediaremote_allow_transient_apple_sessions(void)
 {
-    return !ap2_original_now_playing_profile() &&
-           ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
+    return ap2_env_enabled(
+        "CLIAIRPLAY_MEDIAREMOTE_ALLOW_TRANSIENT_APPLE_SESSIONS", true);
 }
 
-/* Some HomePod software accepts type-130 state but only exposes the session
- * to Home/Control Center after legacy MediaRemote registration arrives on
- * /command. Keep this opt-in for receivers that accept both transports. */
-static bool ap2_mrp_type130_dual_enabled(void)
+static bool ap2_dmap_extended_metadata_enabled(void)
 {
-    return !ap2_original_now_playing_profile() &&
-           ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130_DUAL", false);
+    return ap2_env_enabled("CLIAIRPLAY_DMAP_EXTENDED_METADATA", true);
 }
 
-static bool ap2_mrp_refresh_enabled(void)
+static bool ap2_mediaremote_include_artwork_url(void)
 {
-    return !ap2_original_now_playing_profile() &&
-           ap2_env_enabled("CLIAIRPLAY_MRP_REFRESH", false);
+    return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_INCLUDE_ARTWORK_URL", true);
 }
 
-static bool ap2_mrp_leader_only_enabled(void)
+/* Single answer for the opt-in DataStream sidecar: the setup site and the
+ * status reporter must agree, or status would describe a channel that was
+ * never set up. */
+static bool ap2_mediaremote_sidecar_enabled(void)
 {
-    return !ap2_original_now_playing_profile() &&
-           ap2_env_enabled("CLIAIRPLAY_MRP_LEADER_ONLY", false);
+    return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_SIDECAR_DATASTREAM", false);
+}
+
+/* Some receivers may require main-session registration in addition to the
+ * sidecar state. Keep this as an explicit, independent A/B switch. */
+static bool ap2_mediaremote_sidecar_keep_main_session(void)
+{
+    return ap2_env_enabled(
+        "CLIAIRPLAY_MEDIAREMOTE_SIDECAR_KEEP_MAIN_SESSION_PUBLICATION", false);
+}
+
+static bool ap2_mediaremote_periodic_refresh(void)
+{
+    return ap2_env_enabled(
+        "CLIAIRPLAY_MEDIAREMOTE_MAIN_SESSION_PERIODIC_REFRESH", false);
+}
+
+static bool ap2_mediaremote_group_leader_only(void)
+{
+    return ap2_env_enabled("CLIAIRPLAY_MEDIAREMOTE_GROUP_LEADER_ONLY", false);
 }
 
 /* ---- Native AP2 failure reporting ---- */
@@ -2512,7 +2524,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* 6b. MRP now-playing. The default compatibility path uses POST /command;
      * the opt-in type-130 path carries the same state in SET_STATE protobufs.
      * Keep setup best-effort so a failed now-playing channel cannot stop audio. */
-    if (ap2_mrp_type130_enabled())
+    if (ap2_mediaremote_enabled() && ap2_mediaremote_sidecar_enabled())
         ap2_native_setup_mrp_sidecar(p);
 
     /* Create ALAC encoder */
@@ -3321,9 +3333,18 @@ struct ap2cl_s *ap2cl_create(
              device->name ? device->name : "unknown",
              device->address, device->port,
              p->flow == FLOW_NATIVE_AP2 ? "native AP2" : "RAOP-compat");
-    if (ap2_original_now_playing_profile())
-        LOG_INFO("[AP2] Now Playing profile: original "
-                 "(auth-only MRP, v0.5.2 DMAP, legacy progress)");
+    LOG_INFO(
+        "[AP2] Now Playing config: mediaremote=%d transient_apple=%d "
+        "dmap_extended=%d artwork_url=%d sidecar_datastream=%d "
+        "sidecar_keep_main=%d main_refresh=%d leader_only=%d",
+        ap2_mediaremote_enabled(),
+        ap2_mediaremote_allow_transient_apple_sessions(),
+        ap2_dmap_extended_metadata_enabled(),
+        ap2_mediaremote_include_artwork_url(),
+        ap2_mediaremote_sidecar_enabled(),
+        ap2_mediaremote_sidecar_keep_main_session(),
+        ap2_mediaremote_periodic_refresh(),
+        ap2_mediaremote_group_leader_only());
     return p;
 }
 
@@ -5134,7 +5155,7 @@ static uint8_t ap2_dmap_player_state(const struct ap2cl_s *p)
 
 /* Reproduce the v0.5.2 native DMAP payload exactly: one mlit with mikd,
  * title/artist/album and track number. Stereo/PTP code remains current. */
-static bool ap2_native_send_original_metadata(
+static bool ap2_native_send_minimal_metadata(
     struct ap2cl_s *p, const char *title, const char *artist, const char *album)
 {
     if (!p || p->sock_fd < 0) return false;
@@ -5177,7 +5198,7 @@ static bool ap2_native_send_original_metadata(
                                   buf, (int)(q - buf),
                                   "application/x-dmap-tagged", rtpinfo,
                                   &resp, &resp_len);
-    LOG_INFO("[AP2] native original-profile metadata SET_PARAMETER -> "
+    LOG_INFO("[AP2] native minimal DMAP metadata SET_PARAMETER -> "
              "status %d (%d bytes)", status, (int)(q - buf));
     free(resp);
     free(buf);
@@ -5195,8 +5216,8 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
 {
     if (!p || p->sock_fd < 0)
         return false;
-    if (ap2_original_now_playing_profile())
-        return ap2_native_send_original_metadata(p, title, artist, album);
+    if (!ap2_dmap_extended_metadata_enabled())
+        return ap2_native_send_minimal_metadata(p, title, artist, album);
     uint64_t persistent_id = ap2_dmap_item_id(item_id, title, artist, album);
     uint32_t item_id32 = (uint32_t)(persistent_id ^ (persistent_id >> 32));
     if (!item_id32)
@@ -5268,10 +5289,11 @@ static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
 static bool ap2_mrp_session_eligible(const struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2) return false;
-    if (ap2_original_now_playing_profile())
-        return p->auth_credentials != NULL;
-    return (p->auth_credentials || p->apple_model) &&
-           (!ap2_mrp_leader_only_enabled() || p->group_peer_count < 2 ||
+    bool eligible = p->auth_credentials != NULL ||
+                    (p->apple_model &&
+                     ap2_mediaremote_allow_transient_apple_sessions());
+    return eligible &&
+           (!ap2_mediaremote_group_leader_only() || p->group_peer_count < 2 ||
             (p->group_peers && p->group_peers[0] && p->device.address &&
              strcmp(p->device.address, p->group_peers[0]) == 0));
 }
@@ -5279,14 +5301,14 @@ static bool ap2_mrp_session_eligible(const struct ap2cl_s *p)
 /* Lazily create MediaRemote for pair-verified native sessions and transient
  * Apple receivers, then attach the encrypted reverse event channel before
  * advertising any controllable state. Transient-paired third-party speakers
- * never receive these Apple-specific messages. Set CLIAIRPLAY_MRP=0 to disable
- * the path for diagnosis. */
+ * never receive these Apple-specific messages. Set
+ * CLIAIRPLAY_MEDIAREMOTE_ENABLED=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
     if (p->mrp || !ap2_mrp_session_eligible(p) ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
-    if (!ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
+    if (!ap2_mediaremote_enabled()) return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name,
                             p->session_uuid, p->group_uuid,
@@ -5344,7 +5366,8 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
      * A late command-path publisher can race the channel setup; suppress it
      * here as the final transport boundary so HomePod never sees duplicate
      * now-playing messages on both encrypted channels. */
-    if (p && ap2_mrp_type130_enabled() && !ap2_mrp_type130_dual_enabled() &&
+    if (p && ap2_mediaremote_sidecar_enabled() &&
+        !ap2_mediaremote_sidecar_keep_main_session() &&
         p->mrp &&
         ap2_mrp_is_connected(p->mrp))
         return 200;
@@ -5370,13 +5393,14 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
  * cannot accidentally publish the same state over both transports. */
 static bool ap2_mrp_channel_active(struct ap2cl_s *p)
 {
-    return p && ap2_mrp_type130_enabled() && p->mrp &&
+    return p && ap2_mediaremote_enabled() &&
+           ap2_mediaremote_sidecar_enabled() && p->mrp &&
            ap2_mrp_is_connected(p->mrp);
 }
 
 static bool ap2_mrp_should_send_dmap(bool channel_active)
 {
-    return !channel_active || ap2_mrp_type130_dual_enabled();
+    return !channel_active || ap2_mediaremote_sidecar_keep_main_session();
 }
 
 /* The feedback worker owns type-130 writes. Callers only mark the MRP state
@@ -5403,7 +5427,8 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 {
     if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
         return -1;
-    if (ap2_mrp_channel_active(p) && !ap2_mrp_type130_dual_enabled())
+    if (ap2_mrp_channel_active(p) &&
+        !ap2_mediaremote_sidecar_keep_main_session())
         return 200;
     if (!force && p->mrp_last_playback_state == state) return 200;
 
@@ -5498,7 +5523,7 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized_with(
 
     if (channel_active) {
         result = ap2cl_mrp_push_channel_serialized(p);
-        if (!ap2_mrp_type130_dual_enabled()) return result;
+        if (!ap2_mediaremote_sidecar_keep_main_session()) return result;
     }
 
     if (!p->mrp_device_registered && ap2cl_mrp_register_serialized(p) != 1) {
@@ -5536,8 +5561,8 @@ static void ap2cl_mrp_refresh_if_due(struct ap2cl_s *p)
 {
     enum { MRP_FULL_REFRESH_MS = 15000 };
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0 ||
-        !ap2_mrp_refresh_enabled() ||
-        ap2_mrp_type130_enabled() ||
+        !ap2_mediaremote_periodic_refresh() ||
+        ap2_mediaremote_sidecar_enabled() ||
         p->state != AP2_STREAMING || p->content_paused ||
         p->content_stopped)
         return;
@@ -5630,11 +5655,10 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p)
  *    1 = channel established (now-playing active). */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 ||
-        (!p->auth_credentials && !p->apple_model)) return -1;
+    if (!p || !ap2_mrp_session_eligible(p)) return -1;
     /* The type-130 channel is opt-in (see ap2_native_connect §6b); when it is
      * not attempted, report "not applicable" so the channel status is omitted. */
-    if (!ap2_mrp_type130_enabled()) return -1;
+    if (!ap2_mediaremote_enabled() || !ap2_mediaremote_sidecar_enabled()) return -1;
     pthread_mutex_lock(&p->mrp_lock);
     int status = (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
     pthread_mutex_unlock(&p->mrp_lock);
@@ -5653,7 +5677,7 @@ static int ap2cl_mrp_register_serialized(struct ap2cl_s *p)
     bool channel_active = ap2_mrp_channel_active(p);
     pthread_mutex_unlock(&p->mrp_lock);
     if (!have_mrp) return -1;
-    if (channel_active && !ap2_mrp_type130_dual_enabled()) {
+    if (channel_active && !ap2_mediaremote_sidecar_keep_main_session()) {
         p->mrp_device_registered = true;
         return 1;
     }
@@ -5726,7 +5750,7 @@ bool ap2cl_set_metadata_ex_url(struct ap2cl_s *p, const char *title,
     bool channel_active = ap2_mrp_channel_active(p);
     bool track_changed = false;
     const char *effective_artwork_url =
-        ap2_original_now_playing_profile() ? NULL : artwork_url;
+        ap2_mediaremote_include_artwork_url() ? artwork_url : NULL;
     if (p->mrp)
         ap2_mrp_set_track_url(p->mrp, title, artist, album, duration * 1000,
                               item_id, effective_artwork_url, content_type, art_data,
@@ -6217,29 +6241,44 @@ bool ap2cl_test_mrp_group_publisher(const char *device_address,
     return ap2_mrp_session_eligible(&client);
 }
 
-bool ap2cl_test_env_enabled(const char *name, bool unset_default)
+bool ap2cl_test_mediaremote_enabled(void)
 {
-    return ap2_env_enabled(name, unset_default);
+    return ap2_mediaremote_enabled();
 }
 
-bool ap2cl_test_original_now_playing_profile(void)
+bool ap2cl_test_mediaremote_allow_transient_apple_sessions(void)
 {
-    return ap2_original_now_playing_profile();
+    return ap2_mediaremote_allow_transient_apple_sessions();
 }
 
-bool ap2cl_test_mrp_type130_enabled(void)
+bool ap2cl_test_dmap_extended_metadata_enabled(void)
 {
-    return ap2_mrp_type130_enabled();
+    return ap2_dmap_extended_metadata_enabled();
 }
 
-bool ap2cl_test_mrp_refresh_enabled(void)
+bool ap2cl_test_mediaremote_include_artwork_url(void)
 {
-    return ap2_mrp_refresh_enabled();
+    return ap2_mediaremote_include_artwork_url();
 }
 
-bool ap2cl_test_mrp_leader_only_enabled(void)
+bool ap2cl_test_mediaremote_sidecar_enabled(void)
 {
-    return ap2_mrp_leader_only_enabled();
+    return ap2_mediaremote_sidecar_enabled();
+}
+
+bool ap2cl_test_mediaremote_sidecar_keep_main_session(void)
+{
+    return ap2_mediaremote_sidecar_keep_main_session();
+}
+
+bool ap2cl_test_mediaremote_periodic_refresh(void)
+{
+    return ap2_mediaremote_periodic_refresh();
+}
+
+bool ap2cl_test_mediaremote_group_leader_only(void)
+{
+    return ap2_mediaremote_group_leader_only();
 }
 
 bool ap2cl_test_mrp_dmap_enabled(bool channel_active)
