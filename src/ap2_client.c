@@ -211,6 +211,8 @@ struct ap2cl_s {
     char *active_remote;
     char *iface;
     char *publish_ip;         /* address we advertise to the device (multi-homed) */
+    char **group_peers;       /* other receiver addresses in this playback group */
+    size_t group_peer_count;
     struct in_addr bind_addr; /* resolved local bind address (INADDR_ANY if none) */
     char *secret;
     char *password;
@@ -963,6 +965,24 @@ static int ap2_rtsp_send_tracked(
         resp_body, resp_len, request_started);
 }
 
+static const char *ap2_setpeers_uri(const struct ap2cl_s *p)
+{
+    /* Native groups use the receiver-wide notification endpoint used by
+     * Apple-compatible senders. Keep the established session URL for solo
+     * playback, where no explicit receiver group was supplied. */
+    return p->group_peer_count > 1 ? "/peer-list-changed" : p->session_url;
+}
+
+static bool ap2_set_dscp_ef(int fd, const char *label)
+{
+    const int tos = 0xB8; /* DSCP EF (46) in the upper six TOS bits. */
+    if (setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)) == 0)
+        return true;
+    LOG_WARN("[AP2] Cannot mark %s socket DSCP EF: %s", label,
+             strerror(errno));
+    return false;
+}
+
 /* Keep a sent packet available for retransmission. Called on the audio thread
  * right after the packet goes out; the ring is indexed by sequence number so a
  * request is a direct lookup and old entries retire on their own. */
@@ -1562,14 +1582,18 @@ static void ap2_parse_format_capability(const uint8_t *data, size_t len,
         *known = true;
 }
 
-/* Build one timing-peer dict {ID, DeviceType, ClockID, SupportsClockPort..., Addresses:[addr]}. */
-static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, const char *addr)
+/* Build one timing-peer dict for a session SETUP. */
+static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id,
+                                         const char *addr, bool native_group)
 {
     ap2_pl_node *d = ap2_pl_dict();
     ap2_pl_dict_set(d, "ID", ap2_pl_string(id));
-    ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
-    ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
-    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+    if (!native_group) {
+        ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
+        ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
+    }
+    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride",
+                    ap2_pl_bool(native_group));
     ap2_pl_node *addrs = ap2_pl_array();
     ap2_pl_array_append(addrs, ap2_pl_string(addr));
     ap2_pl_dict_set(d, "Addresses", addrs);
@@ -2010,8 +2034,14 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                      "following it instead of serving ours");
         if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
             p->use_ptp = true;
-            ap2_ptp_shared_register(p->ptp, p->device.address, follow);
-            ap2_ptp_engine_settle(p->ptp, 400);
+            if (p->group_peer_count > 1) {
+                ap2_ptp_shared_register_group(
+                    p->ptp, (const char *const *)p->group_peers,
+                    p->group_peer_count);
+            } else {
+                ap2_ptp_shared_register(p->ptp, p->device.address, follow);
+                ap2_ptp_engine_settle(p->ptp, 400);
+            }
         } else if ((follow ? ap2_ptp_follow_receiver(p->ptp, p->device.address) : true) &&
                    ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
             p->use_ptp = true;
@@ -2050,24 +2080,36 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_gen_uuid(peer_id);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
-        /* Advertise OUR clock as the session timeline (the engine holds
-         * grandmaster): receivers only follow masters from the timing-peer
-         * list — us — and cannot anchor to their own clock. The media anchor
-         * below is expressed against this same clock domain. */
+        /* Advertise the current shared timeline. A native HomePod group may
+         * still be in its initial sender-GM negotiation here; after stream
+         * SETUP it yields to the leader and subsequent RTP sync packets use
+         * the newly elected clock ID. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
 
         ap2_pl_node *root = ap2_pl_dict();
         ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
         ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
         ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
-        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
-        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
-        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
-        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        bool native_group = p->group_peer_count > 1;
+        if (native_group) {
+            /* Match the proven airplay2-rs group SETUP. Group membership is
+             * expressed by SETPEERS; per-connection random group UUIDs describe
+             * two unrelated groups and make HomePods accept both streams without
+             * lighting the secondary as part of the stereo session. */
+            ap2_pl_dict_set(root, "timingPort", ap2_pl_int(319));
+        } else {
+            ap2_pl_dict_set(root, "name", ap2_pl_string(name));
+            ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
+            ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
+            ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        }
         ap2_pl_dict_set(root, "timingPeerInfo",
-                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+                        ap2_make_timing_peer(peer_id, timeline_id, our_addr,
+                                             native_group));
         ap2_pl_node *peer_list = ap2_pl_array();
-        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
+        ap2_pl_array_append(peer_list,
+                            ap2_make_timing_peer(peer_id, timeline_id, our_addr,
+                                                 native_group));
         ap2_pl_dict_set(root, "timingPeerList", peer_list);
 
         plist_len = ap2_pl_serialize(root, &plist_data);
@@ -2153,6 +2195,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     p->data_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (p->data_sock < 0 || !ap2_set_nonblocking(p->data_sock, "RTP data"))
         return false;
+    ap2_set_dscp_ef(p->data_sock, "RTP data");
     struct sockaddr_in bind_addr = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
     if (bind(p->data_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
         LOG_ERROR("[AP2] Cannot bind RTP data socket: %s", strerror(errno));
@@ -2166,6 +2209,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     p->ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (p->ctrl_sock < 0 || !ap2_set_nonblocking(p->ctrl_sock, "RTP control"))
         return false;
+    ap2_set_dscp_ef(p->ctrl_sock, "RTP control");
     if (bind(p->ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0) {
         LOG_ERROR("[AP2] Cannot bind RTP control socket: %s", strerror(errno));
         return false;
@@ -2325,6 +2369,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     LOG_INFO("[AP2] Stream SETUP OK");
     free(resp);
 
+    /* A HomePod starts advertising its clock only after the RTSP session and
+     * audio stream exist. Native groups therefore settle shared BMCA here,
+     * then use the elected leader clock for SETPEERS and RTP sync packets. */
+    if (p->use_ptp && p->group_peer_count > 1)
+        ap2_ptp_engine_settle(p->ptp, 3500);
+
     /* Buffered audio: open the TCP data connection to the receiver's
      * dataPort. The socket stays blocking with a short send deadline; a
      * receiver that throttles its reads (they pull ahead of render on their
@@ -2372,30 +2422,56 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                  p->device.address, ntohs(p->data_addr.sin_port));
     }
 
-    /* 6. SETPEERS (PTP only): a bare binary-plist array of IP strings
-     * [receiver, us] so the receiver knows the timing group members. */
+    /* 6. SETPEERS (PTP only): a bare binary-plist array of IP strings. Apple
+     * senders put every receiver in the playback group in this list, followed
+     * by the sender address. The target is always included even when the
+     * caller did not provide an explicit group peer list. */
     if (p->use_ptp) {
+#define AP2_MAX_SETPEERS 66
+        const char *peers[AP2_MAX_SETPEERS];
+        int peer_count = 0;
+#define AP2_ADD_SETPEER(value) do { \
+            const char *peer_value = (value); \
+            bool duplicate = false; \
+            if (peer_value && *peer_value) { \
+                for (int peer_i = 0; peer_i < peer_count; peer_i++) \
+                    if (strcmp(peers[peer_i], peer_value) == 0) { \
+                        duplicate = true; \
+                        break; \
+                    } \
+                if (!duplicate && peer_count < AP2_MAX_SETPEERS) \
+                    peers[peer_count++] = peer_value; \
+            } \
+        } while (0)
+        for (size_t i = 0; i < p->group_peer_count; i++)
+            AP2_ADD_SETPEER(p->group_peers[i]);
+        AP2_ADD_SETPEER(p->device.address);
+        AP2_ADD_SETPEER(our_addr);
+
         ap2_pl_node *arr = ap2_pl_array();
-        ap2_pl_array_append(arr, ap2_pl_string(p->device.address));
-        ap2_pl_array_append(arr, ap2_pl_string(our_addr));
+        for (int i = 0; i < peer_count; i++)
+            ap2_pl_array_append(arr, ap2_pl_string(peers[i]));
         uint8_t *sp_data = NULL;
         int sp_len = ap2_pl_serialize(arr, &sp_data);
         ap2_pl_free(arr);
 
         resp = NULL; resp_len = 0;
-        int sp_status = ap2_rtsp_send(p, "SETPEERS", p->session_url, sp_data, sp_len,
+        const char *setpeers_uri = ap2_setpeers_uri(p);
+        int sp_status = ap2_rtsp_send(p, "SETPEERS", setpeers_uri, sp_data, sp_len,
                                        "application/x-apple-binary-plist", &resp, &resp_len);
         free(sp_data);
         free(resp);
-        LOG_INFO("[AP2] SETPEERS [%s, %s] -> %d", p->device.address, our_addr, sp_status);
+        LOG_INFO("[AP2] SETPEERS uri=%s group peers=%d -> %d",
+                 setpeers_uri, peer_count, sp_status);
         if (sp_status <= 0) return false;
 
-        const char *peers[2] = { p->device.address, our_addr };
-        ap2_ptp_set_peers(p->ptp, peers, 2);
+        ap2_ptp_set_peers(p->ptp, peers, peer_count);
         /* Kick timing at the fresh peer so it measures our clock right away
          * (no-op without a shared daemon; the in-process engine kicks itself
          * from ap2_ptp_set_peers). */
         ap2_ptp_shared_kick(p->ptp);
+#undef AP2_ADD_SETPEER
+#undef AP2_MAX_SETPEERS
     }
 
     /* 6b. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
@@ -2560,9 +2636,10 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            /* When slaving to a receiver's clock (follow mode) the timeline is
-             * NOT the host clock: shift the commanded unix instant into
-             * the master domain by the current local->master offset. */
+            /* When slaving to a receiver's clock (follow mode or a native
+             * group) the timeline is NOT the host clock: shift the commanded
+             * unix instant into the master domain by the current
+             * local->master offset. */
             int64_t master_shift = (int64_t)wall - (int64_t)ap2_ptp_now_ns(p->ptp);
             p->rt_anchor_wall0 = (uint64_t)((int64_t)unix_ns + master_shift)
                                - (uint64_t)p->lead_ms * 1000000ULL;
@@ -3312,6 +3389,8 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
     if (p->events_sock >= 0) close(p->events_sock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
+    for (size_t i = 0; i < p->group_peer_count; i++) free(p->group_peers[i]);
+    free(p->group_peers);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
     free(p->meta_title); free(p->meta_artist); free(p->meta_album);
@@ -3346,6 +3425,26 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
     if (!p || !ip) return;
     free(p->publish_ip);
     p->publish_ip = strdup(ip);
+}
+
+void ap2cl_set_group_peers(struct ap2cl_s *p, const char *const *peers,
+                           size_t count)
+{
+    if (!p) return;
+    for (size_t i = 0; i < p->group_peer_count; i++) free(p->group_peers[i]);
+    free(p->group_peers);
+    p->group_peers = NULL;
+    p->group_peer_count = 0;
+    if (!peers || count == 0) return;
+
+    p->group_peers = calloc(count, sizeof(*p->group_peers));
+    if (!p->group_peers) return;
+    for (size_t i = 0; i < count; i++) {
+        if (!peers[i] || !*peers[i]) continue;
+        p->group_peers[p->group_peer_count] = strdup(peers[i]);
+        if (p->group_peers[p->group_peer_count]) p->group_peer_count++;
+    }
+    LOG_INFO("[AP2] Group peer addresses configured: %zu", p->group_peer_count);
 }
 
 /* Effective splice queue depth: the compiled default unless the caller
@@ -3549,6 +3648,10 @@ static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
                                      const struct ap2_ptp_exchange *ex,
                                      uint64_t now_unix_ms)
 {
+    /* In a native HomePod group the receiver leader owns the clock. Once the
+     * shared daemon has an offset lock, there is no sender-side probe streak to
+     * age: the common clock is already usable by every stream in the group. */
+    if (ap2_ptp_shared_group_clock_ready(p->ptp)) return now_unix_ms;
     uint64_t first_ms = ex->first_ms < now_unix_ms ? ex->first_ms : now_unix_ms;
     uint64_t ready = now_unix_ms - first_ms + AP2_CLOCK_LOCK_MS;
     if (p->apple_model && ex->count >= AP2_CLOCK_SEAT_EXCHANGES) {
@@ -3565,6 +3668,10 @@ static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
  * poller snapshot instead of calling this. */
 static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
 {
+    if (ap2_ptp_shared_group_clock_ready(p->ptp)) {
+        memset(ex, 0, sizeof(*ex));
+        return true;
+    }
     return ap2_ptp_peer_exchange(p->ptp, p->device.address, ex);
 }
 
@@ -4416,9 +4523,14 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
             ev->at_unix_ms = anchor_ms;
             ev->margin_ms = (int64_t)(anchor_ms - ready_ms);
             result = AP2_CLOCK_VERIFY_VERIFIED;
-            LOG_INFO("[AP2] clock verified: probe streak began %" PRIu64
-                     " ms before the anchor, readiness margin %" PRId64 " ms",
-                     ex.first_ms, ev->margin_ms);
+            if (ap2_ptp_shared_group_clock_ready(p->ptp)) {
+                LOG_INFO("[AP2] clock verified: shared HomePod leader is locked, "
+                         "readiness margin %" PRId64 " ms", ev->margin_ms);
+            } else {
+                LOG_INFO("[AP2] clock verified: probe streak began %" PRIu64
+                         " ms before the anchor, readiness margin %" PRId64 " ms",
+                         ex.first_ms, ev->margin_ms);
+            }
         } else if (!p->clock_verify_enforce) {
             /* Origin start: the shortfall is reported for lead tuning but
              * the anchor stands — the receiver self-seats a fresh session
@@ -4776,6 +4888,7 @@ void ap2cl_stop(struct ap2cl_s *p)
 {
     if (!p) return;
     ap2_clock_verify_disarm(p);
+    if (p->ptp) ap2_ptp_shared_unregister_group(p->ptp);
     p->content_paused = false;
     p->content_stopped = false;
     ap2_content_skip_reset(p, "stop");
@@ -5684,6 +5797,16 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+const char *ap2cl_test_setpeers_uri(struct ap2cl_s *p)
+{
+    return ap2_setpeers_uri(p);
+}
+
+bool ap2cl_test_set_dscp_ef(int fd)
+{
+    return ap2_set_dscp_ef(fd, "test");
+}
+
 /* Hand the client a ready MRP context without a paired session, so a test can
  * drive the /command now-playing path against a scripted RTSP peer. The
  * client takes ownership (ap2cl_destroy frees it). */

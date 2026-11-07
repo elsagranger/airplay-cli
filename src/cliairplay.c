@@ -109,6 +109,12 @@ typedef struct {
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
     bool buffered;          /* force the buffered audio stream (type 103) */
 
+    /* Native AirPlay 2 group signaling. These are all receiver addresses in
+     * leader-first order; the active target is added if missing and the local
+     * sender address is appended when the AP2 client builds SETPEERS. */
+    char *group_peers[64];
+    size_t group_peer_count;
+
     /* Audio format */
     int sample_rate;
     int bit_depth;
@@ -1571,6 +1577,9 @@ static int run_airplay2(cli_config_t *cfg)
         ap2cl_force_native(client);
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(client, cfg->publish_ip);
+    if (cfg->group_peer_count)
+        ap2cl_set_group_peers(client, (const char *const *)cfg->group_peers,
+                              cfg->group_peer_count);
     ap2cl_set_ptp(client, cfg->route.ptp);
     if (cfg->splice_depth_ms > 0)
         ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
@@ -2123,6 +2132,8 @@ static void print_usage(const char *name)
     printf("                             uses native AirPlay 2 ALAC (0x80000/0x200000)\n");
     printf("  --channels <n>             Channel count (default: 2)\n");
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
+    printf("  --peer <ip>                Receiver in the native AirPlay 2 group;\n");
+    printf("                             may be repeated for every group member\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --check                    Print check info and exit\n");
     printf("  --clock-offset-ns <ns>     Run START_UNIX_MS and AirPlay timing on the raw\n");
@@ -2237,6 +2248,7 @@ int main(int argc, char *argv[])
         {"raw",          no_argument,       0, 1006},
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
+        {"peer",         required_argument, 0, 1016},
         {"ptp",          no_argument,       0, 1009},
         {"timing",       required_argument, 0, 1014},
         {"buffered",     no_argument,       0, 1010},
@@ -2298,6 +2310,14 @@ int main(int argc, char *argv[])
         case 1006: cfg.raw = true; break;
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
+        case 1016:
+            if (cfg.group_peer_count >= sizeof(cfg.group_peers) / sizeof(cfg.group_peers[0])) {
+                fprintf(stderr, "Too many --peer addresses (maximum %zu)\n",
+                        sizeof(cfg.group_peers) / sizeof(cfg.group_peers[0]));
+                return 1;
+            }
+            cfg.group_peers[cfg.group_peer_count++] = optarg;
+            break;
         case 1009: cfg.ptp = true; break;
         case 1010: cfg.buffered = true; break;
         case 1011: ptp_daemon_mode = true; break;

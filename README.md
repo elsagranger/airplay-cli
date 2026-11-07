@@ -217,6 +217,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--ap2-native` | Force the native flow without credentials (transient pairing), whatever the TXT advertises. |
 | `--txt <k=v ...>` | mDNS TXT records of the `_airplay._tcp` service; drives route auto-selection. |
 | `--publish-ip <ip>` | Address advertised to devices (timing-peer lists) when it differs from the bind address (Docker bridge, NAT). |
+| `--peer <ip>` | Receiver in the native AirPlay 2 playback group; repeat for every member, leader first. The local sender address is appended to `SETPEERS`, and the list is sent to `/peer-list-changed`. |
 | `--name <name>` | Device name (native flow). |
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
