@@ -335,7 +335,8 @@ string takes precedence. Unknown codes, booleans and nested command fields are
 acknowledged without triggering a transport action.
 
 The `/command` capability list also enables absolute scrubbing (command `24`).
-Its finite, nonnegative `kMRMediaRemoteOptionPlaybackPosition` number, at root
+Incoming seek requests accept modern `24` or legacy `value=spos`. Their
+finite, nonnegative `kMRMediaRemoteOptionPlaybackPosition` number, at root
 or directly in `params`, is emitted as `[EVENT] seek position=<seconds>` after
 the encrypted ACK. The controller must seek the owning media queue and publish
 the resulting progress; changing metadata alone does not move the audio.
@@ -351,6 +352,10 @@ track change on one album redraws the receiver's now-playing screen.
 Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
+
+The first START from stopped also sends a complete playing bundle before
+state 1, including the current duration, item identity, elapsed, timestamp
+and artwork. Later pause/resume and progress corrections use lean updates.
 
 The DMAP path receives the detected image type and original bytes. Before MRP
 staging, a bounded metadata probe requires `image/jpeg`, SOI, and a terminal

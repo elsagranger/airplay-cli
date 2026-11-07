@@ -7,12 +7,14 @@ ports are used. This verifies protocol negotiation, not Apple's iOS UI.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import plistlib
 import socket
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -404,11 +406,20 @@ def run(binary):
                     receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=code,
                                    params={position_key: position})
                     cli.wait(f'[EVENT] seek position={position:.6f}')
+                receiver.event('spos', modernMediaRemoteCommand='24',
+                               params={position_key: 51.25})
+                cli.wait('[EVENT] seek position=51.250000')
+                homepod_seek = json.loads((Path(__file__).parent / 'fixtures' / 'homepod-spos.json').read_text())
+                receiver.event(**homepod_seek)
+                cli.wait('[EVENT] seek position=61.661476')
+                receiver.event('spos', params={position_key: 61})
+                cli.wait('[EVENT] seek position=61.000000')
                 with cli.condition:
                     before = len(cli.lines)
                 for invalid in [True, '42', -1, -0.5, float('nan'), float('inf'), -float('inf')]:
                     receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand='24',
                                    params={position_key: invalid})
+                    receiver.event('spos', params={position_key: invalid})
                 receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24)
                 receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24,
                                params={'payload': {position_key: 20}})
@@ -430,6 +441,7 @@ def run(binary):
                 # Drive actual PCM and pause/resume timeline publication.
                 cli.proc.stdin.write(b'\0' * (352 * 4 * 8))
                 cli.proc.stdin.flush()
+                start_request_index = len(receiver.requests)
                 cli.wait('[STATUS] audio buffered_ms=')
                 cli.send('START_UNIX_MS=0\nACTION=START')
                 cli.wait('[STATUS] started')
@@ -444,6 +456,23 @@ def run(binary):
                         b'\0' * 4 + audio_packet[-8:], audio_packet[12:-8], audio_packet[4:12])
                 assert (int.from_bytes(second_packet[2:4], 'big') - int.from_bytes(packet[2:4], 'big')) & 0xffff == 1
                 assert (int.from_bytes(second_packet[4:8], 'big') - int.from_bytes(packet[4:8], 'big')) & 0xffffffff == 352
+                rows = receiver.wait(lambda rows: any(
+                    root and root.get('type') == 'updateMRPlaybackState'
+                    and root['params'].get('mrPlaybackState') == 1
+                    for _, _, root, _ in rows[start_request_index:]))
+                first_playing = next(root for root in commands(rows[start_request_index:])
+                                     if root.get('type') == 'updateMRNowPlayingInfo')
+                assert first_playing['params']['mergePolicy'] == 'replace', first_playing
+                first_info = first_playing['params']['params']
+                prefix = 'kMRMediaRemoteNowPlayingInfo'
+                assert first_info[prefix + 'Duration'] == 180.0
+                assert 0 <= first_info[prefix + 'ElapsedTime'] < 1
+                assert first_info[prefix + 'PlaybackRate'] == 1.0
+                assert first_info[prefix + 'UniqueIdentifier'] == commands(rows)[1]['params']['params'][prefix + 'UniqueIdentifier']
+                timestamp = first_info[prefix + 'Timestamp']
+                assert isinstance(timestamp, datetime)
+                assert -0.1 <= (datetime.now(timezone.utc).replace(tzinfo=None) - timestamp).total_seconds() < 12
+                assert first_info[prefix + 'ArtworkData'] == artwork.read_bytes()
                 cli.send('ACTION=PAUSE')
                 cli.wait('[STATUS] paused')
                 receiver.wait(lambda rows: any(root and root.get('type') == 'updateMRPlaybackState'
@@ -460,7 +489,7 @@ def run(binary):
                     assert not any(method == 'SET_PARAMETER' and body.startswith(b'\xff\xd8')
                                    for method, _, _, body in rows)
                 print(f'PASS {features}: HAP verification, SETUP relay/group, MRP sequence/identity, '
-                      'five controls, volume, unknown ACK, PCM, pause/resume')
+                      'legacy/modern controls and seeks, volume, PCM, complete first START, pause/resume')
             finally:
                 if cli:
                     cli.close()

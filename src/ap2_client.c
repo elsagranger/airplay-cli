@@ -444,6 +444,7 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      ap2_mrp_playback_state_t state,
                                      bool force);
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p);
 static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
     struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
@@ -5341,9 +5342,14 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
      * state-only. */
     if (state != AP2_MRP_PLAYBACK_STOPPED) {
         bool state_was_current = p->mrp_last_playback_state == state;
-        if (ap2_mrp_status_ok(
-                ap2cl_mrp_push_progress_serialized(p).overall_status) &&
-            !state_was_current)
+        /* A stopped item may predate NowPlayingClient registration. Bootstrap
+         * playback with its complete duration/identity/timeline; later seeks
+         * and pause/resume keep the receiver's artwork via lean updates. */
+        ap2_mrp_push_result_t push =
+            p->mrp_last_playback_state == AP2_MRP_PLAYBACK_STOPPED
+                ? ap2cl_mrp_push_serialized(p)
+                : ap2cl_mrp_push_progress_serialized(p);
+        if (ap2_mrp_status_ok(push.overall_status) && !state_was_current)
             force = false;
     }
     ap2_mrp_send_playback_state(p, state, force);

@@ -1189,7 +1189,8 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
         return false;
     }
 
-    if (modern && (strcmp(value, "24") == 0 || modern_number == 24)) {
+    if ((!modern && strcmp(value, "spos") == 0) ||
+        (modern && (strcmp(value, "24") == 0 || modern_number == 24))) {
         *have_seek = ap2_bplist_get_root_number(
             body, (size_t)body_len, "kMRMediaRemoteOptionPlaybackPosition", "params", position) &&
             isfinite(*position) && *position >= 0.0;

@@ -696,6 +696,13 @@ the correct frozen elapsed is judged worth the re-render on such receivers,
 none of which have been observed in practice. The ~15 s defensive state
 re-push belongs to the type-130 channel below, which is off by default.
 
+Starting a previously stopped item publishes one complete `replace` bundle
+before state 1: duration, stable identity, elapsed, rate, reference timestamp
+and retained artwork. The pre-START bundle can precede client registration
+and has rate 0; it is not the complete playing bootstrap. Later seeks and
+pause/resume retain the lean update path. The real-CLI loopback smoke checks
+the first playing tuple before exercising pause/resume.
+
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
 is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
 
@@ -769,8 +776,9 @@ are accepted, never booleans or nested lookalikes. The encrypted ACK precedes
 the callback. `[EVENT] volume value=<0..1>` is already applied on the device,
 so callers update their per-device state without sending a volume echo.
 
-Modern command `24` carries an absolute seek position in seconds via numeric
-`kMRMediaRemoteOptionPlaybackPosition`, at root or in direct `params`. Finite,
+Modern command `24` or legacy `value=spos` carries an absolute seek position
+in seconds via numeric `kMRMediaRemoteOptionPlaybackPosition`, at root or in
+direct `params`. Finite,
 nonnegative targets produce `[EVENT] seek position=<seconds>` after the ACK;
 the caller, not the CLI metadata state, owns rebuilding playback at that target.
 Music Assistant routes the event through its existing player seek controller,
