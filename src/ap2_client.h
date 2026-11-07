@@ -423,8 +423,8 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
 /*
- * Set the track metadata and artwork as one bundle: DMAP metadata (and, when
- * artwork is given, DMAP artwork) on the transport in use, plus exactly one
+ * Set the track metadata and artwork as one bundle: negotiated DMAP metadata
+ * and artwork on the transport in use, plus exactly one
  * serialized MediaRemote replace push carrying item, timeline and artwork
  * together — the shape a real Apple sender emits at a track change. item_id
  * is the sender's stable per-track identity ("" = none): MediaRemote keys
@@ -434,8 +434,8 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
  * drops retained MRP artwork when the track changed. track_changed_out
  * (optional) receives whether the item identity changed; mrp_info and
  * mrp_push receive the request-scoped artwork verdict and push statuses.
- * Returns whether the whole bundle was delivered (DMAP, and the MRP push
- * where active) — a fully byte-identical bundle after a delivered one is
+ * Returns whether the whole negotiated bundle was delivered (DMAP only when
+ * advertised, and the MRP push where active). A fully byte-identical bundle is
  * skipped and reported as delivered.
  */
 bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
@@ -468,9 +468,11 @@ bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
 
 /* Push the current now-playing state and any pending MediaRemote extended
- * metadata over POST /command. Enabled for pair-verified native sessions;
- * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
- * failure, or -1 when the push does not apply to this session. */
+ * metadata over POST /command. Enabled for encrypted native sessions advertising
+ * MetadataFeatures_3 (bit 50); CLIAIRPLAY_MRP=0 disables it. Returns the HTTP
+ * status, a transport error, or -1 when the push does not apply. Refusal of a
+ * full now-playing body stops publication for this session; lean refusal first
+ * tries the full shape. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
 /* Same, but with the timeline-correction body shape (see
@@ -481,7 +483,7 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p);
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p);
 
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
- * -1 = not attempted (non-Apple / not pair-verified), 0 = attempted but not up,
+ * -1 = not attempted (not negotiated or disabled), 0 = attempted but not up,
  * 1 = channel established. */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p);
 
@@ -545,6 +547,12 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
 void ap2cl_set_group_peers(struct ap2cl_s *p, const char *const *peers,
                            size_t count);
 
+/* Set the shared playback-group identity before connecting. uuid must be a
+ * canonical 36-character hexadecimal UUID with hyphens (either case).
+ * Returns false for malformed UUIDs or an already connecting/connected client.
+ * Without this setter solo playback gets a random group UUID per session. */
+bool ap2cl_set_group_uuid(struct ap2cl_s *p, const char *uuid);
+
 /* Return the requested format and the /info-advertised format capabilities
  * (populated by the native flow's GET /info; zeroed otherwise). */
 void ap2cl_format_capabilities(struct ap2cl_s *p,
@@ -554,6 +562,11 @@ void ap2cl_format_capabilities(struct ap2cl_s *p,
  * before ap2cl_connect(); the callback remains fixed for that session. */
 void ap2cl_set_remote_command_callback(
     struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata);
+
+/* Receive remote receiver volume as a normalized 0..1 value, without sending
+ * a SET_PARAMETER echo. Configure before connecting, as for remote commands. */
+void ap2cl_set_remote_volume_callback(
+    struct ap2cl_s *p, ap2_remote_volume_cb_t callback, void *userdata);
 
 /*
  * Get the effective playback lead and the receiver-reported buffering window.

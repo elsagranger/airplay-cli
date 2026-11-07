@@ -24,11 +24,11 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   realtime (type 96) streaming with PTP or NTP timing, and buffered
   (type 103, RTP over TCP + `SETRATEANCHORTIME`) auto-selected on receivers
   that advertise it.
-- **Apple MediaRemote metadata**: Apple targets (pair-verified, or
-  transient-paired Apple receivers such as HomePods) receive the full
-  now-playing client, playback-state, transport-command, text and artwork
-  sequence used by current Apple senders, and their Siri / touch-surface
-  commands are reported as `[EVENT] remote command=`.
+- **MediaRemote metadata and controls**: native HAP receivers advertising
+  `MetadataFeatures_3` (feature bit 50) receive now-playing text/artwork,
+  playback state and the supported transport controls. Session SETUP advertises
+  relay/multi-select support; receiver commands appear as `[EVENT] remote
+  command=` and device volume as `[EVENT] volume value=<0..1>`.
 - **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
   shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
 - **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs
@@ -39,6 +39,11 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 - **Commanded group starts**: on every protocol, `START_UNIX_MS` schedules the
   first sample to be audible at an exact wall-clock instant, so every member of
   a sync group is handed the same instant and aligns by construction.
+- **Shared playback identity**: `--group-uuid <uuid>` gives all member processes
+  the same AirPlay group in SETUP and MediaRemote; each connection retains its
+  own session UUID. Use a new group UUID for a new playback session, retaining
+  it across warm track changes and late joins. Without it, solo sessions get
+  independent random identities; `--peer` alone is not a shared group identity.
 
 ## Usage
 
@@ -306,10 +311,28 @@ lists every line, the stream it uses, and when it fires.
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded
 start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
-Native Apple sessions (pair-verified or transient) additionally mirror these
-updates over MediaRemote `POST /command`, including explicit play/pause/stop
-state. Set `CLIAIRPLAY_MRP=0` only to disable that path for comparison or
-diagnosis.
+Native encrypted sessions advertising feature bit 50 additionally send
+MediaRemote `POST /command`, including explicit play/pause/stop state. This
+includes MRP-only receivers such as shairport-sync even when they advertise no
+legacy text/artwork/progress bits; those legacy sends are capability-gated.
+`CLIAIRPLAY_MRP=0` disables both the SETUP relay flags and MRP publication for
+diagnosis. A receiver refusing a full now-playing command is not asked again
+for that session; audio and event acknowledgements continue. Failure to open
+the event socket does not block outbound now-playing.
+
+The CLI reports remote `play`, `pause`, `play_pause`, `next`, and `previous`
+without operating the upstream queue itself. The controller must keep explicit
+play/pause idempotent, toggle only `play_pause`, and select/start the new item
+for next/previous. Every framed event, including unsupported ones, receives an
+encrypted acknowledgement before its callback. Device-volume events report the
+already-applied normalized level: multiply by 100 for percentage, or by 30 and
+subtract 30 for AirPlay dB. Do not echo that feedback back to the receiver.
+Both command formats are supported: legacy root `value` strings
+`play`/`paus`/`plps`/`nitm`/`pitm`, and root `modernMediaRemoteCommand`
+strings `0`/`1`/`2`/`4`/`5`, respectively. If both fields contain strings,
+`value` takes precedence. Unknown codes, non-string modern values and nested
+command fields are acknowledged without triggering a transport action.
+
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,
@@ -347,10 +370,20 @@ make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 
 # Focused native regression tests
 make test STATIC=1
+
+# Linux using system OpenSSL (the local deployment configuration)
+make test OPENSSL=/usr
+
+# Real CLI + authenticated loopback receiver (requires Python cryptography)
+make test-mrp-cli OPENSSL=/usr
 ```
 
-Requires the libraop submodule with pre-built static libraries (OpenSSL,
-libcodecs, libmdns).
+Requires the libraop submodule with pre-built libcodecs and libmdns. Use
+`STATIC=1` for bundled OpenSSL, or `OPENSSL=/usr` for system OpenSSL on Linux.
+The loopback smoke verifies HAP encryption, SETUP flags/shared group identity,
+decoded now-playing payloads, five controls, device volume, unknown-event ACKs,
+audio packet authentication/continuity, pause/resume, opt-out and refusal. It
+uses no physical receivers and does not verify iOS UI rendering.
 
 ## Platforms and CI
 
@@ -421,6 +454,10 @@ copied:
 - **[OwnTone](https://github.com/owntone/owntone-server)** — AirPlay 2 / HAP
   reference; specifically the RTP sync-packet layout (`rtp_common.c`) and the
   gPTP grandmaster dataset that iOS senders announce (`libairptp`).
+- **[Djoko-cli's OwnTone branch](https://github.com/Djoko-cli/owntone-server/tree/feat/airplay-one-group)**
+  — protocol behavior from `a50f1f4d` (now-playing/relay), `479a1023`
+  (transport semantics and event ACKs), `2547f019` (device volume), `4f5a57d8`
+  (MRP-only receivers), and `2e7fab73` (shared playback-group identity).
 - **[pyatv](https://github.com/postlund/pyatv)** — the MediaRemote / DataStream
   remote-control channel and the protobuf message/field numbers, plus AirPlay 2
   protocol detail ([pyatv.dev](https://pyatv.dev/documentation/protocols/)).

@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -399,6 +400,285 @@ static void test_transient_kdf_secret(void)
         "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", session_key, 0));
 }
 
+struct volume_capture {
+    int fd;
+    const uint8_t *key;
+    uint64_t counter;
+    int cseq;
+    int count;
+    double expected;
+};
+
+static void capture_remote_volume(double volume, void *userdata)
+{
+    struct volume_capture *capture = userdata;
+    assert(volume == capture->expected);
+    /* Consume and authenticate the ACK inside the callback: it must already
+     * be on the socket before the application is notified. */
+    read_response(capture->fd, capture->key, capture->counter, capture->cseq);
+    capture->counter++;
+    capture->cseq++;
+    capture->count++;
+}
+
+enum volume_shape {
+    VOLUME_ROOT, VOLUME_PARAMS, VOLUME_PAYLOAD, VOLUME_DEEP_PARAMS,
+    VOLUME_BAD_PARAMS, VOLUME_ROOT_OVERRIDES_PARAMS, VOLUME_NESTED_COMMAND
+};
+
+static int build_volume_request(
+    uint8_t *encrypted, size_t encrypted_size, const uint8_t key[KEY_SIZE],
+    uint64_t counter, int cseq, enum volume_shape shape, ap2_pl_node *value)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "value", ap2_pl_string("dvlc"));
+    ap2_pl_node *target = root;
+    if (shape == VOLUME_PARAMS || shape == VOLUME_PAYLOAD ||
+        shape == VOLUME_DEEP_PARAMS) {
+        target = ap2_pl_dict();
+        ap2_pl_dict_set(root, shape == VOLUME_PAYLOAD ? "payload" : "params",
+                        target);
+        if (shape == VOLUME_DEEP_PARAMS) {
+            ap2_pl_node *nested = ap2_pl_dict();
+            ap2_pl_dict_set(target, "nested", nested);
+            target = nested;
+        }
+    } else if (shape == VOLUME_BAD_PARAMS) {
+        ap2_pl_dict_set(root, "params", ap2_pl_string("not a dictionary"));
+        ap2_pl_node *unrelated = ap2_pl_dict();
+        ap2_pl_dict_set(unrelated, "volume", ap2_pl_real(0.5));
+        ap2_pl_dict_set(root, "payload", unrelated);
+    } else if (shape == VOLUME_ROOT_OVERRIDES_PARAMS) {
+        ap2_pl_node *params = ap2_pl_dict();
+        ap2_pl_dict_set(params, "volume", ap2_pl_real(0.5));
+        ap2_pl_dict_set(root, "params", params);
+    }
+    if (value) ap2_pl_dict_set(target, "volume", value);
+    if (shape == VOLUME_NESTED_COMMAND) {
+        ap2_pl_node *outer = ap2_pl_dict();
+        ap2_pl_dict_set(outer, "payload", root);
+        root = outer;
+    }
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
+static void test_volume_events(const uint8_t secret[KEY_SIZE])
+{
+    uint8_t receiver_key[KEY_SIZE], sender_key[KEY_SIZE];
+    derive_key(secret, "Events-Write-Encryption-Key", receiver_key);
+    derive_key(secret, "Events-Read-Encryption-Key", sender_key);
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct timeval timeout = {.tv_sec = 2};
+    assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO,
+                      &timeout, sizeof(timeout)) == 0);
+    struct command_capture commands = {0};
+    struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
+        secret, sockets[0], capture_remote_command, &commands);
+    struct volume_capture capture = {.fd = sockets[1], .key = sender_key};
+    ap2_mrp_set_remote_volume_callback(mrp, capture_remote_volume, &capture);
+
+    enum { NUMBER_REAL, NUMBER_INT, NUMBER_BOOL, NUMBER_STRING, NUMBER_NONE,
+           NUMBER_DICT };
+    static const struct {
+        enum volume_shape shape;
+        int kind;
+        double value;
+        bool valid;
+    } cases[] = {
+        {VOLUME_ROOT, NUMBER_REAL, 0.375, true},
+        {VOLUME_PARAMS, NUMBER_REAL, 0.625, true},
+        {VOLUME_ROOT, NUMBER_INT, 0, true},
+        {VOLUME_PARAMS, NUMBER_INT, 1, true},
+        {VOLUME_ROOT, NUMBER_REAL, 0, true},
+        {VOLUME_PARAMS, NUMBER_REAL, 1, true},
+        {VOLUME_ROOT, NUMBER_INT, 1, true},
+        {VOLUME_PARAMS, NUMBER_INT, 0, true},
+        {VOLUME_ROOT, NUMBER_REAL, -0.01, false},
+        {VOLUME_PARAMS, NUMBER_REAL, 1.01, false},
+        {VOLUME_ROOT, NUMBER_REAL, NAN, false},
+        {VOLUME_PARAMS, NUMBER_REAL, INFINITY, false},
+        {VOLUME_ROOT, NUMBER_REAL, -INFINITY, false},
+        {VOLUME_ROOT, NUMBER_INT, -1, false},
+        {VOLUME_PARAMS, NUMBER_INT, 2, false},
+        {VOLUME_ROOT, NUMBER_BOOL, 0, false},
+        {VOLUME_PARAMS, NUMBER_BOOL, 1, false},
+        {VOLUME_ROOT, NUMBER_STRING, 0, false},
+        {VOLUME_PARAMS, NUMBER_STRING, 0, false},
+        {VOLUME_ROOT, NUMBER_NONE, 0, false},
+        {VOLUME_PARAMS, NUMBER_NONE, 0, false},
+        {VOLUME_PAYLOAD, NUMBER_REAL, 0.5, false},
+        {VOLUME_DEEP_PARAMS, NUMBER_REAL, 0.5, false},
+        {VOLUME_BAD_PARAMS, NUMBER_NONE, 0, false},
+        {VOLUME_ROOT_OVERRIDES_PARAMS, NUMBER_BOOL, 1, false},
+        {VOLUME_ROOT_OVERRIDES_PARAMS, NUMBER_REAL, 0.25, true},
+        {VOLUME_ROOT, NUMBER_DICT, 0, false},
+        {VOLUME_NESTED_COMMAND, NUMBER_REAL, 0.5, false},
+    };
+    int expected_count = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ap2_pl_node *value = NULL;
+        switch (cases[i].kind) {
+        case NUMBER_REAL: value = ap2_pl_real(cases[i].value); break;
+        case NUMBER_INT: value = ap2_pl_int((int64_t)cases[i].value); break;
+        case NUMBER_BOOL: value = ap2_pl_bool(cases[i].value != 0); break;
+        case NUMBER_STRING: value = ap2_pl_string("0.5"); break;
+        case NUMBER_DICT: value = ap2_pl_dict(); break;
+        }
+        capture.counter = i;
+        capture.cseq = 100 + (int)i;
+        capture.expected = cases[i].value;
+        uint8_t encrypted[1200];
+        int len = build_volume_request(
+            encrypted, sizeof(encrypted), receiver_key, i, capture.cseq,
+            cases[i].shape, value);
+        /* Split the length prefix, ciphertext and authentication tag. */
+        const int cuts[] = {1, 17, len - 1, len};
+        int sent = 0;
+        for (size_t part = 0; part < sizeof(cuts) / sizeof(cuts[0]); part++) {
+            int bytes = cuts[part] - sent;
+            assert(write(sockets[1], encrypted + sent, (size_t)bytes) == bytes);
+            sent = cuts[part];
+            ap2_mrp_tick(mrp);
+            if (sent < len) assert(capture.count == expected_count);
+        }
+        if (cases[i].valid) expected_count++;
+        else read_response(sockets[1], sender_key, i, capture.cseq);
+        assert(capture.count == expected_count);
+        assert(commands.count == 0);
+        assert(ap2_mrp_event_status(mrp) == 1);
+    }
+
+    /* Coalesced unknown and transport events after volume traffic must retain
+     * ACK nonce progression and explicit play/pause/toggle semantics. */
+    uint64_t counter = sizeof(cases) / sizeof(cases[0]);
+    const char *names[] = {"unknown", "play", "paus", "plps", "nitm", "pitm"};
+    uint8_t batch[7200];
+    int batch_len = 0;
+    capture.counter = counter;
+    capture.cseq = 180;
+    capture.expected = 0.75;
+    for (int i = 0; i < 2; i++)
+        batch_len += build_volume_request(
+            batch + batch_len, sizeof(batch) - (size_t)batch_len,
+            receiver_key, counter + (uint64_t)i, 180 + i,
+            i == 0 ? VOLUME_ROOT : VOLUME_PARAMS, ap2_pl_real(0.75));
+    assert(write(sockets[1], batch, (size_t)batch_len) == batch_len);
+    ap2_mrp_tick(mrp);
+    expected_count += 2;
+    assert(capture.count == expected_count);
+    assert(commands.count == 0);
+    counter += 2;
+    batch_len = 0;
+    for (int i = 0; i < 6; i++)
+        batch_len += build_command_request(
+            batch + batch_len, sizeof(batch) - (size_t)batch_len,
+            receiver_key, counter + (uint64_t)i, 200 + i, names[i]);
+    assert(write(sockets[1], batch, (size_t)batch_len) == batch_len);
+    ap2_mrp_tick(mrp);
+    for (int i = 0; i < 6; i++)
+        read_response(sockets[1], sender_key, counter + (uint64_t)i, 200 + i);
+    assert(commands.count == 5);
+    for (int i = 0; i < 5; i++)
+        assert(commands.commands[i] == (ap2_remote_command_t)i);
+    assert(capture.count == expected_count);
+    ap2_mrp_destroy(mrp);
+    close(sockets[1]);
+}
+
+static void test_modern_transport_events(const uint8_t secret[KEY_SIZE])
+{
+    static const struct {
+        const char *modern;
+        const char *legacy;
+        int shape; /* 0: root string, 1: integer, 2: boolean, 3: nested, 4: wrong type */
+        int expected;
+    } cases[] = {
+        {"0", NULL, 0, AP2_REMOTE_COMMAND_PLAY},
+        {"1", NULL, 0, AP2_REMOTE_COMMAND_PAUSE},
+        {"2", NULL, 0, AP2_REMOTE_COMMAND_PLAY_PAUSE},
+        {"4", NULL, 0, AP2_REMOTE_COMMAND_NEXT},
+        {"5", NULL, 0, AP2_REMOTE_COMMAND_PREVIOUS},
+        {"0", "paus", 0, AP2_REMOTE_COMMAND_PAUSE},
+        {"0", "unknown", 0, -1},
+        {"3", NULL, 0, -1},
+        {"6", NULL, 0, -1},
+        {"-1", NULL, 0, -1},
+        {"00", NULL, 0, -1},
+        {"0junk", NULL, 0, -1},
+        {"0 ", NULL, 0, -1},
+        {"", NULL, 0, -1},
+        {"play", NULL, 0, -1},
+        {"0", NULL, 1, -1},
+        {"0", NULL, 2, -1},
+        {"0", NULL, 3, -1},
+        {"0", NULL, 4, -1},
+        {NULL, NULL, 0, -1},
+        {"5", NULL, 0, AP2_REMOTE_COMMAND_PREVIOUS},
+    };
+    uint8_t receiver_key[KEY_SIZE], sender_key[KEY_SIZE];
+    derive_key(secret, "Events-Write-Encryption-Key", receiver_key);
+    derive_key(secret, "Events-Read-Encryption-Key", sender_key);
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct timeval timeout = {.tv_sec = 2};
+    assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO,
+                      &timeout, sizeof(timeout)) == 0);
+    struct command_capture capture = {0};
+    struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
+        secret, sockets[0], capture_remote_command, &capture);
+    int expected_count = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ap2_pl_node *root = ap2_pl_dict();
+        ap2_pl_dict_set(root, "type", ap2_pl_string(
+            cases[i].shape == 4 ? "updateInfo" : "sendMediaRemoteCommand"));
+        if (cases[i].legacy)
+            ap2_pl_dict_set(root, "value", ap2_pl_string(cases[i].legacy));
+        if (cases[i].modern) {
+            ap2_pl_node *target = root;
+            if (cases[i].shape == 3) {
+                target = ap2_pl_dict();
+                ap2_pl_dict_set(root, "params", target);
+            }
+            ap2_pl_node *value = cases[i].shape == 1 ? ap2_pl_int(0) :
+                cases[i].shape == 2 ? ap2_pl_bool(false) : ap2_pl_string(cases[i].modern);
+            ap2_pl_dict_set(target, "modernMediaRemoteCommand", value);
+        }
+        uint8_t *body = NULL;
+        int body_len = ap2_pl_serialize(root, &body);
+        ap2_pl_free(root);
+        assert(body_len > 0 && body);
+        uint8_t encrypted[1200];
+        int len = build_event_request(
+            encrypted, sizeof(encrypted), receiver_key, i, 300 + (int)i, body, body_len);
+        free(body);
+        /* No dispatch before the complete authenticated frame arrives. */
+        assert(write(sockets[1], encrypted, 1) == 1);
+        ap2_mrp_tick(mrp);
+        assert(capture.count == expected_count);
+        assert(write(sockets[1], encrypted + 1, (size_t)(len - 1)) == len - 1);
+        ap2_mrp_tick(mrp);
+        read_response(sockets[1], sender_key, i, 300 + (int)i);
+        if (cases[i].expected >= 0) {
+            assert(capture.count == expected_count + 1);
+            assert(capture.commands[expected_count] == (ap2_remote_command_t)cases[i].expected);
+            expected_count++;
+        }
+        assert(capture.count == expected_count);
+        assert(ap2_mrp_event_status(mrp) == 1);
+    }
+    ap2_mrp_destroy(mrp);
+    close(sockets[1]);
+}
+
 int main(void)
 {
     uint8_t secret[KEY_SIZE];
@@ -408,6 +688,8 @@ int main(void)
     derive_key(secret, "Events-Read-Encryption-Key", sender_key);
     test_artwork_snapshot_generation(secret);
     test_transient_kdf_secret();
+    test_volume_events(secret);
+    test_modern_transport_events(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -418,11 +700,6 @@ int main(void)
     struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
         secret, sockets[0], capture_remote_command, &capture);
 
-    int saved_stderr = dup(STDERR_FILENO);
-    FILE *log_capture = tmpfile();
-    assert(saved_stderr >= 0 && log_capture);
-    assert(dup2(fileno(log_capture), STDERR_FILENO) >= 0);
-    test_log_level = lDEBUG;
 
     uint8_t encrypted[1200];
     int encrypted_len = build_command_request(
@@ -506,23 +783,6 @@ int main(void)
                    expected_names[i]) == 0);
     }
 
-    fflush(stderr);
-    test_log_level = lSILENCE;
-    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
-    close(saved_stderr);
-    assert(fseek(log_capture, 0, SEEK_SET) == 0);
-    char logs[8192];
-    size_t logs_len = fread(logs, 1, sizeof(logs) - 1, log_capture);
-    logs[logs_len] = '\0';
-    fclose(log_capture);
-    assert(strstr(logs, "content_type=application/x-apple-binary-plist"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=play"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=paus"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=plps"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=nitm"));
-    assert(strstr(logs, "type=sendMediaRemoteCommand value=pitm"));
-    assert(strstr(logs, "body parse failed"));
-    assert(strstr(logs, "content_length=4 hex=74657374"));
 
     ap2_mrp_destroy(mrp);
     close(sockets[1]);

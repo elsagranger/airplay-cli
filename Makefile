@@ -146,6 +146,8 @@ else
 LIBRARY += $(OPENSSL)/libopenssl.a
 DEFINES += -DSSL_STATIC_LIB
 endif
+# Protocol tests use the same crypto provider as the executable.
+TEST_CRYPTO_LIBRARY = $(if $(STATIC),$(OPENSSL)/libopenssl.a,)
 
 # Object files
 OBJECTS_RAOP = $(patsubst %.c,$(BUILDDIR)/%.o,$(RAOP_SOURCES))
@@ -203,19 +205,17 @@ $(LIBCODECS_PATCHED): $(CODECS)/$(HOST)/$(PLATFORM)/libcodecs.a
 $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 	$(CXX) $(OBJECTS_ALL) $(LIBRARY) $(LDFLAGS) -o $@
 
-$(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
-	$(CXX) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+$(TEST_EXECUTABLE): $(TEST_OBJECTS) $(TEST_CRYPTO_LIBRARY)
+	$(CXX) $(TEST_OBJECTS) $(TEST_CRYPTO_LIBRARY) $(LDFLAGS) -o $@
 
-$(RAOP_LIFECYCLE_TEST_EXECUTABLE): $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(OPENSSL)/libopenssl.a
-	$(CXX) $(RAOP_LIFECYCLE_TEST_OBJECTS) \
-		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) $(OPENSSL)/libopenssl.a \
-		$(LDFLAGS) -o $@
+$(RAOP_LIFECYCLE_TEST_EXECUTABLE): $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(TEST_CRYPTO_LIBRARY)
+	$(CXX) $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBRARY) $(LDFLAGS) -o $@
 
-$(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+$(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c Makefile
+	$(CC) $(CFLAGS) -UNDEBUG $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
-$(BUILDDIR)/test_ap2_raop_lifecycle.o: tests/test_ap2_raop_lifecycle.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+$(BUILDDIR)/test_ap2_raop_lifecycle.o: tests/test_ap2_raop_lifecycle.c Makefile
+	$(CC) $(CFLAGS) -UNDEBUG $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 $(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
@@ -347,7 +347,7 @@ $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
 		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/ap2_bplist.o \
 		$(BUILDDIR)/bplist.o $(BUILDDIR)/cross_log.o \
-		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+		$(TEST_CRYPTO_LIBRARY) $(LDFLAGS) -o $@
 
 $(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
@@ -374,6 +374,9 @@ $(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
 		build/tests/cross_ssl.o \
 		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) \
 		$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
-		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+		$(TEST_CRYPTO_LIBRARY) $(LDFLAGS) -o $@
 
-.PHONY: all directory clean test
+test-mrp-cli: all
+	python3 tests/cli_mrp_smoke.py --binary $(EXECUTABLE)
+
+.PHONY: all directory clean test test-mrp-cli

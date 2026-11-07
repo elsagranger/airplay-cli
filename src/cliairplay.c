@@ -108,6 +108,7 @@ typedef struct {
     int splice_depth_ms;    /* >0: override the splice receiver-queue depth */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
     bool buffered;          /* force the buffered audio stream (type 103) */
+    char *group_uuid;       /* shared by every process in one playback session */
 
     /* Native AirPlay 2 group signaling. These are all receiver addresses in
      * leader-first order; the active target is added if missing and the local
@@ -524,6 +525,13 @@ static void remote_command_event(
     const char *name = ap2_remote_command_name(command);
     if (!name) return;
     printf("[EVENT] remote command=%s\n", name);
+    fflush(stdout);
+}
+
+static void remote_volume_event(double volume, void *userdata)
+{
+    (void)userdata;
+    printf("[EVENT] volume value=%.6f\n", volume);
     fflush(stdout);
 }
 
@@ -1580,6 +1588,13 @@ static int run_airplay2(cli_config_t *cfg)
     if (cfg->group_peer_count)
         ap2cl_set_group_peers(client, (const char *const *)cfg->group_peers,
                               cfg->group_peer_count);
+    if (cfg->group_uuid && !ap2cl_set_group_uuid(client, cfg->group_uuid)) {
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "group UUID must use the 8-4-4-4-12 hexadecimal format",
+                        "Invalid AirPlay group UUID");
+        ap2cl_destroy(client);
+        return 1;
+    }
     ap2cl_set_ptp(client, cfg->route.ptp);
     if (cfg->splice_depth_ms > 0)
         ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
@@ -1587,6 +1602,7 @@ static int run_airplay2(cli_config_t *cfg)
     ap2cl_set_buffered(client, cfg->route.buffered);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
+    ap2cl_set_remote_volume_callback(client, remote_volume_event, NULL);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
@@ -2134,6 +2150,8 @@ static void print_usage(const char *name)
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --peer <ip>                Receiver in the native AirPlay 2 group;\n");
     printf("                             may be repeated for every group member\n");
+    printf("  --group-uuid <uuid>        Shared AirPlay group identity for this playback;\n");
+    printf("                             pass the same UUID to every member process\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --check                    Print check info and exit\n");
     printf("  --clock-offset-ns <ns>     Run START_UNIX_MS and AirPlay timing on the raw\n");
@@ -2249,6 +2267,7 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"peer",         required_argument, 0, 1016},
+        {"group-uuid",   required_argument, 0, 1017},
         {"ptp",          no_argument,       0, 1009},
         {"timing",       required_argument, 0, 1014},
         {"buffered",     no_argument,       0, 1010},
@@ -2288,6 +2307,7 @@ int main(int argc, char *argv[])
         case 'D': cfg.dacp_id = optarg; break;
         case 'R': cfg.active_remote = optarg; break;
         case 'C': cfg.cmdpipe = optarg; break;
+        case 1017: cfg.group_uuid = optarg; break;
         case 'U': cfg.udn = optarg; break;
         case 'r': cfg.sample_rate = atoi(optarg); break;
         case 'b': cfg.bit_depth = atoi(optarg); break;

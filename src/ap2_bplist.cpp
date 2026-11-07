@@ -299,6 +299,46 @@ int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
     return 0;
 }
 
+int ap2_bplist_get_root_number(const uint8_t *data, size_t len, const char *key,
+                               const char *fallback_dict, double *out)
+{
+    bp_raw_view view;
+    if (!key || !out || !bp_view_init(data, len, &view) ||
+        view.table_ofs < 8)
+        return 0;
+    uint64_t root_ref = bp_read_be(data + len - 16, 8);
+    uint64_t value_ref;
+    if (!bp_dict_find_value_ref(&view, root_ref, key, &value_ref)) {
+        uint64_t dict_ref;
+        if (!fallback_dict ||
+            !bp_dict_find_value_ref(&view, root_ref, fallback_dict, &dict_ref) ||
+            !bp_dict_find_value_ref(&view, dict_ref, key, &value_ref))
+            return 0;
+    }
+    size_t pos = bp_view_obj_ofs(&view, value_ref);
+    if (pos < 8 || pos >= view.table_ofs) return 0;
+    uint8_t marker = data[pos++];
+    if ((marker & 0xf0) == 0x10) {
+        size_t bytes = (size_t)1 << (marker & 0x0f);
+        if (bytes > 8 || bytes > view.table_ofs - pos) return 0;
+        *out = (double)bp_read_be(data + pos, bytes);
+        return 1;
+    }
+    if (marker == 0x22 && view.table_ofs - pos >= 4) {
+        uint32_t bits = (uint32_t)bp_read_be(data + pos, 4);
+        float value;
+        memcpy(&value, &bits, sizeof(value));
+        *out = value;
+        return 1;
+    }
+    if (marker == 0x23 && view.table_ofs - pos >= 8) {
+        uint64_t bits = bp_read_be(data + pos, 8);
+        memcpy(out, &bits, sizeof(*out));
+        return 1;
+    }
+    return 0;
+}
+
 int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out)
 {
     if (!data || !key || !out || len < 40 ||

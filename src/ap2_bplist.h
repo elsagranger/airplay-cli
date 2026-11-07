@@ -91,6 +91,12 @@ int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size);
 
+/* Read a real/integer from the root dictionary. Only when the key is absent,
+ * try its direct child in fallback_dict (if non-NULL). No recursive lookup;
+ * booleans and other types are rejected. */
+int ap2_bplist_get_root_number(const uint8_t *data, size_t len, const char *key,
+                               const char *fallback_dict, double *out);
+
 #ifdef __cplusplus
 }
 #endif

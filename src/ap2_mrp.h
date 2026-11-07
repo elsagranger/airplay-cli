@@ -1,14 +1,12 @@
 /*
  * AirPlay 2 MediaRemote (MRP) SENDER - Header
  *
- * Pushes now-playing state to an Apple device over the AirPlay 2 remote-control
- * data channel (MRP tunnelled over AirPlay 2, the transport tvOS >= 15 uses in
- * place of the retired standalone MRP port). Two goals:
- *   1. make tvOS render the on-screen now-playing UI for our audio stream, the
- *      way it does for an iPhone sender (RTSP SET_PARAMETER metadata is
- *      200-accepted but never drawn);
- *   2. keep the system now-playing session alive so tvOS does not drop to
- *      standby mid-stream.
+ * Pushes now-playing state for AirPlay sessions advertising feature bit 50
+ * (extended metadata), including third-party receivers. Main-channel /command
+ * carries metadata and the reverse event channel carries transport/volume
+ * controls. The optional type-130 data channel tunnels MRP, as used by tvOS
+ * >= 15 in place of the retired standalone MRP port, to render now-playing
+ * and keep the system session alive.
  *
  * Design and protocol notes live in DESIGN.md §8.
  *
@@ -31,6 +29,11 @@ struct ap2_mrp_ctx;
  * the event socket; the callback remains fixed for that session. */
 void ap2_mrp_set_remote_command_callback(
     struct ap2_mrp_ctx *m, ap2_remote_command_cb_t callback, void *userdata);
+
+/* Receive validated device volume events in [0, 1], without echoing them.
+ * Set before attaching the event socket, like the command callback. */
+void ap2_mrp_set_remote_volume_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_volume_cb_t callback, void *userdata);
 
 typedef enum {
     AP2_MRP_PLAYBACK_PLAYING = 1,

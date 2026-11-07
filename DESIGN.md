@@ -628,18 +628,24 @@ normalization, not in the protocol curve.
 tvOS draws its on-screen now-playing UI only from **MediaRemote** state, not
 from the DMAP metadata that speakers consume over RTSP `SET_PARAMETER` (the
 Apple TV 200-accepts that metadata but never renders it; the DMAP path stays,
-because Sonos-class speakers require and consume it). Native Apple sessions
-therefore additionally push MediaRemote now-playing, so an Apple TV
-renders our stream the way it renders an iPhone sender. Maintaining that
-session also keeps tvOS awake mid-stream: tvOS treats the MediaRemote
-now-playing session, not raw RTP flow, as playback activity. The path is gated
-to encrypted native sessions that are either pair-verified (Apple devices in
-practice) or transient-paired with an Apple `model=`/`am=` (a HomePod whose
-access is "Everyone on the same network" pairs transiently — measured on
-HomePod OS 27 — and delivers its Siri / touch-surface commands only on the
-reverse event channel this path services). Transient third-party receivers
-neither need nor render it. `CLIAIRPLAY_MRP=0` disables the whole path
-(diagnostic opt-out).
+because Sonos-class speakers require and consume it). Native encrypted sessions
+advertising `MetadataFeatures_3` (feature bit 50) additionally push MediaRemote.
+The capability, not the receiver model or presence of stored credentials,
+selects this path: transient-paired third-party receivers can require it too.
+Text/artwork/progress capabilities (bits 15–17) are independent; an MRP-only
+receiver is not sent unrequested legacy metadata. `CLIAIRPLAY_MRP=0` disables
+the path, including its SETUP flags.
+
+**Session negotiation.** PTP and NTP session SETUP both advertise
+`senderSupportsRelay=true` and `isMultiSelectAirPlay=true` when MRP is enabled
+and advertised by the receiver. Sending metadata alone does not negotiate
+receiver relay behavior. `--group-uuid` supplies one playback identity across
+the caller's per-player processes; it is reused for SETUP `groupUUID` and
+DEVICE_INFO field 42, including explicit multi-peer sessions. Session UUIDs
+remain per-connection (DEVICE_INFO field 41). The caller owns group lifetime,
+so independent playbacks must not share the UUID. Random solo defaults remain;
+the existing multi-peer shape without an explicit shared UUID is retained.
+Outbound now-playing does not depend on successful reverse-event attachment.
 
 **Channel keys.** The event (`Events-Salt`) and DataStream channel keys are
 HKDF-SHA512 over the pairing's full secret: the 32-byte X25519 shared secret
@@ -665,6 +671,12 @@ connect the sender emits the initial sequence from AirPlaySender's
 4. **`updateMRPlaybackState`** — explicit Playing / Paused / Stopped.
 5. **`updateMRNowPlayingClient`** — the serialized `NowPlayingClient` external
    representation the receiver expects.
+
+Only play, pause, toggle, next and previous are advertised as supported controls
+(MR command values 0, 1, 2, 4, 5). A full now-playing HTTP refusal disables
+further MRP publication for this session without disabling audio or event ACKs;
+transport errors still fail the control channel. Refusal of the lean timeline
+merge policy is separate and retains the full-replace fallback below.
 
 Playback state is re-sent on every start/pause/resume/stop and now-playing on
 every metadata/progress/artwork change — all caller-driven; nothing on this
@@ -741,6 +753,20 @@ returns 200, the new elapsed lands as an in-place content-item update (no
 `SET_STATE` re-render), and `artworkAvailable` stays true. A receiver that
 rejects the policy with an HTTP error automatically gets full replace pushes
 for the rest of the session (`ap2cl_mrp_push_progress`).
+
+**Receiver controls.** `sendMediaRemoteCommand` events accept legacy root
+`value` strings `play`/`paus`/`plps`/`nitm`/`pitm`, or modern root
+`modernMediaRemoteCommand` strings `0`/`1`/`2`/`4`/`5`. Both map to explicit
+play/pause, toggle, next/previous, respectively. A readable legacy string takes
+precedence over the modern field, including when the legacy value is unknown.
+Unknown codes, non-string modern values and nested fields do not dispatch a
+transport action. The CLI emits normalized commands on stdout; queue selection
+and coordinated playback remain in the caller. Unknown events are still
+acknowledged. `dvlc` carries device volume
+at root `volume` or direct `params.volume`: only finite integers/reals in 0..1
+are accepted, never booleans or nested lookalikes. The encrypted ACK precedes
+the callback. `[EVENT] volume value=<0..1>` is already applied on the device,
+so callers update their per-device state without sending a volume echo.
 
 Identity churn is equally destructive and equally guarded: `set_track` mints
 a fresh `UniqueIdentifier` only when the item identity (item id, else the
@@ -980,8 +1006,9 @@ deny-list entry, not a policy retreat.
   keepalives may never read it, and the socket shutdown follows immediately.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
-  `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
-  reported as `[EVENT] remote command=`), and return encrypted
+  `sendMediaRemoteCommand` presses in either legacy `value` or modern
+  `modernMediaRemoteCommand` form, reported as `[EVENT] remote command=`),
+  and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
 - **Single-stream flush-and-refill** — one reader thread drains the persistent
@@ -1158,6 +1185,7 @@ verbosity, never its stream.
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
 | `[EVENT] remote command=` | stdout | device-originated remote-control press |
+| `[EVENT] volume value=` | stdout | validated receiver volume, normalized 0..1 |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

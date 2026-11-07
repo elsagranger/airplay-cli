@@ -59,8 +59,11 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
 bool ap2cl_test_mrp_type130_enabled(void);
-bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,
-                                     bool apple_model);
+bool ap2cl_test_mrp_session_eligible(bool encrypted, uint64_t features);
+int ap2cl_test_setup_identity(struct ap2cl_s *p, bool ptp, bool new_session,
+                               uint8_t **data);
+bool ap2cl_test_prepare_mrp_session(struct ap2cl_s *p);
+void ap2cl_test_remote_volume(struct ap2cl_s *p, double volume);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
 void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p);
@@ -1359,11 +1362,12 @@ typedef struct {
     int expected_requests;
     int request_count;
     command_peer_request_t requests[COMMAND_PEER_MAX_REQUESTS];
+    int response_status[COMMAND_PEER_MAX_REQUESTS]; /* zero means 200 */
     bool ok;
 } command_peer_t;
 
-/* Receiver end for the MediaRemote publication tests: answer every RTSP
- * request with 200 while capturing method, URI and body for inspection. */
+/* Receiver end for MediaRemote publication tests: capture each request and
+ * return its scripted status (default 200). */
 static void *run_command_peer(void *arg)
 {
     command_peer_t *peer = arg;
@@ -1429,7 +1433,8 @@ static void *run_command_peer(void *arg)
         char response[96];
         int response_len = snprintf(
             response, sizeof(response),
-            "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", cseq);
+            "RTSP/1.0 %d Reply\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+            peer->response_status[i] ? peer->response_status[i] : 200, cseq);
         if (write(peer->fd, response, (size_t)response_len) != response_len) {
             peer->ok = false;
             return NULL;
@@ -1962,26 +1967,187 @@ static void test_apple_model_resolution(void)
     puts("ap2_client apple model resolution tests passed");
 }
 
-/* MediaRemote (now-playing + the reverse event channel that carries Siri and
- * touch-surface commands) needs an encrypted session and an Apple receiver.
- * A standalone HomePod with "Everyone on the same network" access pairs
- * transiently, so a transient Apple session must qualify too. */
+/* Capability negotiation does not infer support from model or credentials. */
 static void test_mrp_session_eligibility(void)
 {
-    /* Stored credentials (pair-verified Apple TV / HomePod): eligible, as
-     * before. */
-    assert(ap2cl_test_mrp_session_eligible(true, true, true));
-    assert(ap2cl_test_mrp_session_eligible(true, true, false));
-    /* Transient Apple model (a HomePod open to everyone): eligible. */
-    assert(ap2cl_test_mrp_session_eligible(true, false, true));
-    assert(ap2cl_test_apple_model_default(
-        "acl=0 model=AudioAccessory5,1 osvers=27.0", NULL));
-    /* Transient third-party speaker (Sonos, WiiM, ...): never. */
-    assert(!ap2cl_test_mrp_session_eligible(true, false, false));
-    /* No encrypted session (no HAP context): never. */
-    assert(!ap2cl_test_mrp_session_eligible(false, true, true));
-    assert(!ap2cl_test_mrp_session_eligible(false, false, true));
+    uint64_t mrp_only = ap2_txt_features("model=Shairport features=0x0,0x40000");
+    assert(mrp_only == (1ULL << 50));
+    assert(ap2cl_test_mrp_session_eligible(true, mrp_only));
+    assert(!ap2cl_test_mrp_session_eligible(false, mrp_only));
+    assert(!ap2cl_test_mrp_session_eligible(true, 0));
+    assert(!ap2cl_test_mrp_session_eligible(true, (1ULL << 17)));
     puts("ap2_client MediaRemote session eligibility tests passed");
+}
+
+static void remember_remote_volume(double volume, void *userdata)
+{
+    *(double *)userdata = volume;
+}
+
+/* A bit-50-only receiver never gets unsupported legacy text/art/progress.
+ * Outbound now-playing also works without an event socket. Full refusals
+ * stop subsequent publication, whereas a rejected lean push tries full once. */
+static void test_mrp_only_receiver(void)
+{
+    for (int scenario = 0; scenario < 4; scenario++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        command_peer_t *peer = calloc(1, sizeof(*peer));
+        assert(peer);
+        peer->fd = sockets[1];
+        peer->expected_requests = scenario == 0 ? 6 : scenario == 1 ? 2 :
+                                  scenario == 2 ? 8 : 2;
+        if (scenario == 1) peer->response_status[1] = 400;
+        if (scenario == 2) peer->response_status[5] = 400;
+        if (scenario == 3) peer->response_status[1] = 501;
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, run_command_peer, peer) == 0);
+        ap2_device_info_t device = {
+            .name = "MRP-only receiver", .address = "127.0.0.1", .port = 7000,
+            .txt_records = "model=Shairport features=0x0,0x40000",
+        };
+        ap2_audio_format_t format = { .sample_rate = 44100, .bit_depth = 16,
+                                      .channels = 2 };
+        struct ap2cl_s *client = ap2cl_create(
+            &device, &format, NULL, NULL, "0011223344556677", NULL, 2000, 100);
+        assert(client);
+        ap2cl_force_native(client);
+        if (scenario == 2) {
+            assert(ap2cl_set_group_uuid(client, "01234567-89ab-cdef-0123-456789abcdef"));
+            const char *peers[] = { "127.0.0.1", "127.0.0.2" };
+            ap2cl_set_group_peers(client, peers, 2);
+        }
+        ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+        assert(ap2cl_test_prepare_mrp_session(client));
+        uint8_t *setup = NULL;
+        int setup_len = ap2cl_test_setup_identity(client, false, false, &setup);
+        char session[40], group[40];
+        assert(ap2_bplist_get_root_string(setup, setup_len, "sessionUUID", session, sizeof(session)));
+        assert(ap2_bplist_get_root_string(setup, setup_len, "groupUUID", group, sizeof(group)));
+        free(setup);
+        ap2_mrp_push_result_t push;
+        bool delivered = ap2cl_set_metadata_ex(
+            client, "Track", "Artist", "Album", 180, "item", "image/jpeg",
+            k_baseline_jpeg, sizeof(k_baseline_jpeg), NULL, NULL, &push);
+        assert(delivered == (scenario == 0 || scenario == 2));
+        if (scenario == 1) assert(push.nowplaying_status == 400);
+        if (scenario == 3) assert(push.overall_status == 501);
+        assert(ap2cl_set_progress(client, 42, 180));
+        if (scenario == 0 || scenario == 2) {
+            assert(ap2cl_mrp_push_progress(client) == 200);
+            if (scenario == 2) assert(ap2cl_mrp_push_progress(client) == 200);
+        } else {
+            assert(ap2cl_mrp_push(client) == -1);
+            ap2cl_mrp_publish_playback_state(client);
+            assert(!ap2cl_set_metadata(client, "Next", "Artist", "Album", 200, "next"));
+        }
+        assert(pthread_join(thread, NULL) == 0);
+        assert(peer->ok && peer->request_count == peer->expected_requests);
+        assert(request_has(&peer->requests[0], session));
+        assert(request_has(&peer->requests[0], group));
+        for (int i = 0; i < peer->request_count; i++) {
+            assert(strcmp(peer->requests[i].method, "POST") == 0);
+            assert(strcmp(peer->requests[i].uri, "/command") == 0);
+        }
+        if (scenario == 2) {
+            assert(request_has(&peer->requests[5], "update"));
+            assert(request_has(&peer->requests[6], "replace"));
+            assert(request_has(&peer->requests[7], "replace"));
+        }
+        double volume = -1;
+        ap2cl_set_remote_volume_callback(client, remember_remote_volume, &volume);
+        ap2cl_test_remote_volume(client, 0.375);
+        assert(volume == 0.375);
+        char extra[64];
+        assert(recv(sockets[1], extra, sizeof(extra), MSG_DONTWAIT) == -1);
+        assert(errno == EAGAIN || errno == EWOULDBLOCK);
+        ap2cl_test_detach_rtsp_socket(client);
+        assert(close(sockets[0]) == 0);
+        assert(close(sockets[1]) == 0);
+        assert(ap2cl_destroy(client));
+        free(peer);
+    }
+    puts("ap2_client MRP-only negotiation/refusal/fallback tests passed");
+}
+
+static void test_native_session_identity(void)
+{
+    const char *uuid = "01234567-89ab-cdef-0123-456789abcdef";
+    const char *peers[] = { "127.0.0.1", "127.0.0.2" };
+    ap2_device_info_t device = { .name = "group test", .address = "127.0.0.1",
+        .port = 7000, .txt_records = "features=0x0,0x40000" };
+    ap2_audio_format_t format = { .sample_rate = 44100, .bit_depth = 16,
+                                  .channels = 2 };
+    char previous_session[40] = "";
+    for (int grouped = 0; grouped < 2; grouped++) {
+        for (int ptp = 0; ptp < 2; ptp++) {
+            struct ap2cl_s *client = ap2cl_create(
+                &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+            assert(client);
+            ap2cl_force_native(client);
+            assert(!ap2cl_set_group_uuid(client, NULL));
+            assert(!ap2cl_set_group_uuid(client, "0123456789ab-cdef-0123-456789abcdef"));
+            assert(!ap2cl_set_group_uuid(client, "g1234567-89ab-cdef-0123-456789abcdef"));
+            if (grouped) ap2cl_set_group_peers(client, peers, 2);
+            assert(ap2cl_set_group_uuid(client, uuid));
+            uint8_t *body = NULL;
+            int len = ap2cl_test_setup_identity(client, ptp, true, &body);
+            assert(len > 0);
+            char group[40], session[40];
+            assert(ap2_bplist_get_root_string(body, len, "groupUUID", group, sizeof(group)));
+            assert(ap2_bplist_get_root_string(body, len, "sessionUUID", session, sizeof(session)));
+            assert(strcmp(group, uuid) == 0 && strcmp(session, uuid) != 0);
+            assert(strcmp(session, previous_session) != 0);
+            strcpy(previous_session, session);
+            assert(bytes_contain_string(body, len, "senderSupportsRelay"));
+            assert(bytes_contain_string(body, len, "isMultiSelectAirPlay"));
+            free(body);
+            assert(setenv("CLIAIRPLAY_MRP", "0", 1) == 0);
+            len = ap2cl_test_setup_identity(client, ptp, true, &body);
+            assert(len > 0);
+            assert(bytes_contain_string(body, len, uuid));
+            assert(!bytes_contain_string(body, len, "senderSupportsRelay"));
+            assert(!bytes_contain_string(body, len, "isMultiSelectAirPlay"));
+            free(body);
+            assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+            ap2cl_test_set_session_state(client, AP2_CONNECTING);
+            assert(!ap2cl_set_group_uuid(client, uuid));
+            ap2cl_test_set_session_state(client, AP2_DOWN);
+            assert(ap2cl_destroy(client));
+        }
+    }
+    /* The default solo group remains random, and differs from its session. */
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    char previous_group[40] = "";
+    for (int i = 0; i < 2; i++) {
+        uint8_t *body = NULL;
+        int len = ap2cl_test_setup_identity(client, false, true, &body);
+        char group[40], session[40];
+        assert(ap2_bplist_get_root_string(body, len, "groupUUID", group, sizeof(group)));
+        assert(ap2_bplist_get_root_string(body, len, "sessionUUID", session, sizeof(session)));
+        assert(strcmp(group, session) != 0 && strcmp(group, previous_group) != 0);
+        strcpy(previous_group, group);
+        free(body);
+    }
+    /* Without an explicit UUID, native peer grouping does not advertise a
+     * random solo group. With no feature 50, relay is not negotiated. */
+    ap2cl_set_group_peers(client, peers, 2);
+    uint8_t *body = NULL;
+    int len = ap2cl_test_setup_identity(client, true, true, &body);
+    assert(len > 0 && !bytes_contain_string(body, len, "groupUUID"));
+    free(body);
+    assert(ap2cl_destroy(client));
+    device.txt_records = "model=AppleTV11,1 features=0x20000,0x0";
+    client = ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    len = ap2cl_test_setup_identity(client, false, true, &body);
+    assert(len > 0 && !bytes_contain_string(body, len, "senderSupportsRelay"));
+    assert(!bytes_contain_string(body, len, "isMultiSelectAirPlay"));
+    free(body);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client shared group/session identity tests passed");
 }
 
 /* The pacing window is a duration, so every term scales with the stream rate:
@@ -2814,6 +2980,8 @@ int main(void)
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
     test_mrp_session_eligibility();
+    test_mrp_only_receiver();
+    test_native_session_identity();
     test_pacing_window_rate_scaling();
     test_splice_depth_override_vs_reported_buffer();
     test_splice_depth_bounds();
