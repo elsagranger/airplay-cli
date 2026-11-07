@@ -317,8 +317,9 @@ includes MRP-only receivers such as shairport-sync even when they advertise no
 legacy text/artwork/progress bits; those legacy sends are capability-gated.
 `CLIAIRPLAY_MRP=0` disables both the SETUP relay flags and MRP publication for
 diagnosis. A receiver refusing a full now-playing command is not asked again
-for that session; audio and event acknowledgements continue. Failure to open
-the event socket does not block outbound now-playing.
+for that session; audio and event acknowledgements continue, and progress
+falls back to legacy SET_PARAMETER when the receiver advertises that capability.
+Failure to open the event socket does not block outbound now-playing.
 
 The CLI reports remote `play`, `pause`, `play_pause`, `next`, and `previous`
 without operating the upstream queue itself. The controller must keep explicit

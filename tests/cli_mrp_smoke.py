@@ -469,6 +469,13 @@ def run(binary):
             cli.send('TITLE=Next Track\nITEMID=reject-2\nACTION=SENDMETA\nPROGRESS=4')
             receiver.wait(lambda rows: sum(method == 'SET_PARAMETER' and body.startswith(b'mlit')
                                           for method, _, _, body in rows) >= 2)
+            rows = receiver.wait(lambda rows: any(method == 'SET_PARAMETER' and body.startswith(b'progress: ')
+                                                 for method, _, _, body in rows))
+            progress = next(body for method, _, _, body in rows
+                            if method == 'SET_PARAMETER' and body.startswith(b'progress: '))
+            start, current, end = map(int, progress.split(b': ', 1)[1].strip().split(b'/'))
+            assert (current - start) & 0xffffffff == 4 * 44100, progress
+            assert end == current, progress
             cli.close()
             cli = None
             assert len(commands(receiver.requests)) == 2, commands(receiver.requests)

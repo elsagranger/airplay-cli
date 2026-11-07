@@ -5706,7 +5706,7 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
-    bool have_mrp = p->mrp != NULL;
+    bool have_mrp = p->mrp != NULL && !atomic_load(&p->mrp_rejected);
     /* The content flags, not the wire state, decide the published rate: a
      * splice pause keeps the client AP2_STREAMING with content_paused set. */
     if (p->mrp)
