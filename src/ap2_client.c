@@ -281,6 +281,8 @@ struct ap2cl_s {
     void *remote_command_userdata;
     ap2_remote_volume_cb_t remote_volume_cb;
     void *remote_volume_userdata;
+    ap2_remote_seek_cb_t remote_seek_cb;
+    void *remote_seek_userdata;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -464,6 +466,13 @@ static void ap2_remote_volume_received(double volume, void *userdata)
     struct ap2cl_s *p = userdata;
     if (p && p->remote_volume_cb)
         p->remote_volume_cb(volume, p->remote_volume_userdata);
+}
+
+static void ap2_remote_seek_received(double position, void *userdata)
+{
+    struct ap2cl_s *p = userdata;
+    if (p && p->remote_seek_cb)
+        p->remote_seek_cb(position, p->remote_seek_userdata);
 }
 
 /* ---- Environment toggles ---- */
@@ -1733,6 +1742,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
     ap2_mrp_set_remote_volume_callback(p->mrp, ap2_remote_volume_received, p);
+    ap2_mrp_set_remote_seek_callback(p->mrp, ap2_remote_seek_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
@@ -3599,6 +3609,14 @@ void ap2cl_set_remote_volume_callback(
     p->remote_volume_userdata = userdata;
 }
 
+void ap2cl_set_remote_seek_callback(
+    struct ap2cl_s *p, ap2_remote_seek_cb_t callback, void *userdata)
+{
+    if (!p) return;
+    p->remote_seek_cb = callback;
+    p->remote_seek_userdata = userdata;
+}
+
 ap2_connect_error_t ap2cl_connect_error(struct ap2cl_s *p, int *http_status,
                                         const char **detail)
 {
@@ -5203,6 +5221,7 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
     ap2_mrp_set_remote_volume_callback(p->mrp, ap2_remote_volume_received, p);
+    ap2_mrp_set_remote_seek_callback(p->mrp, ap2_remote_seek_received, p);
     if (p->events_sock >= 0) {
         if (ap2_mrp_attach_events(p->mrp, p->events_sock))
             p->events_sock = -1;

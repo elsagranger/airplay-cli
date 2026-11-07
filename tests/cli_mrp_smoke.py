@@ -347,8 +347,11 @@ def inspect_sequence(receiver, group):
         assert info[42].decode().upper() == group.upper()
     supported = sequence[2]['params']['mrSupportedCommandsFromSender']
     entries = [plistlib.loads(item) for item in supported]
-    assert {entry['kCommandInfoCommandKey'] for entry in entries} == {0, 1, 2, 4, 5}, entries
+    assert {entry['kCommandInfoCommandKey'] for entry in entries} == {0, 1, 2, 4, 5, 24}, entries
     assert all(entry['kCommandInfoEnabledKey'] is True for entry in entries)
+    seek = next(entry for entry in entries if entry['kCommandInfoCommandKey'] == 24)
+    assert seek['kCommandInfoOptionsKey']['kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey'] is True
+    assert seek['kCommandInfoOptionsKey']['kMRMediaRemoteCommandInfoSupportsReferencePosition'] is False
     client = protobuf(sequence[4]['params']['mrNowPlayingClient'])
     assert client[2] == b'com.apple.Music'
     wrapper = sequence[1]['params']
@@ -387,7 +390,8 @@ def run(binary):
                     receiver.event(value)
                     cli.wait(f'[EVENT] remote command={expected}')
                 for code, expected in [('0', 'play'), ('1', 'pause'), ('2', 'play_pause'),
-                                       ('4', 'next'), ('5', 'previous')]:
+                                       ('4', 'next'), ('5', 'previous'), (0, 'play'), (1, 'pause'),
+                                       (2, 'play_pause'), (4, 'next'), (5, 'previous')]:
                     with cli.condition:
                         before = len(cli.lines)
                     receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=code)
@@ -395,6 +399,28 @@ def run(binary):
                         assert cli.condition.wait_for(
                             lambda: any(f'[EVENT] remote command={expected}' in line
                                         for line in cli.lines[before:]), 5), cli.lines[before:]
+                position_key = 'kMRMediaRemoteOptionPlaybackPosition'
+                for code, position in [('24', 42.5), (24, 0)]:
+                    receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=code,
+                                   params={position_key: position})
+                    cli.wait(f'[EVENT] seek position={position:.6f}')
+                with cli.condition:
+                    before = len(cli.lines)
+                for invalid in [True, '42', -1, -0.5, float('nan'), float('inf'), -float('inf')]:
+                    receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand='24',
+                                   params={position_key: invalid})
+                receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24)
+                receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24,
+                               params={'payload': {position_key: 20}})
+                receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24,
+                               **{position_key: False}, params={position_key: 20})
+                # A valid final event is a processing barrier for preceding invalid requests.
+                receiver.event(type='sendMediaRemoteCommand', modernMediaRemoteCommand=24,
+                               params={position_key: 123.75})
+                cli.wait('[EVENT] seek position=123.750000')
+                with cli.condition:
+                    assert [line for line in cli.lines[before:] if line.startswith('[EVENT] seek ')] == [
+                        '[EVENT] seek position=123.750000']
                 receiver.event('dvlc', volume=0.42)
                 cli.wait('[EVENT] volume value=0.420000')
                 receiver.event('dvlc', params={'volume': 1})

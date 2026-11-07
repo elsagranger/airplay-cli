@@ -568,6 +568,10 @@ void ap2cl_set_remote_command_callback(
 void ap2cl_set_remote_volume_callback(
     struct ap2cl_s *p, ap2_remote_volume_cb_t callback, void *userdata);
 
+/* Receive absolute receiver seek requests in seconds. Configure before connecting. */
+void ap2cl_set_remote_seek_callback(
+    struct ap2cl_s *p, ap2_remote_seek_cb_t callback, void *userdata);
+
 /*
  * Get the effective playback lead and the receiver-reported buffering window.
  *

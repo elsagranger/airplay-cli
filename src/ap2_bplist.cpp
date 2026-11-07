@@ -321,7 +321,8 @@ int ap2_bplist_get_root_number(const uint8_t *data, size_t len, const char *key,
     if ((marker & 0xf0) == 0x10) {
         size_t bytes = (size_t)1 << (marker & 0x0f);
         if (bytes > 8 || bytes > view.table_ofs - pos) return 0;
-        *out = (double)bp_read_be(data + pos, bytes);
+        uint64_t value = bp_read_be(data + pos, bytes);
+        *out = bytes == 8 ? (double)(int64_t)value : (double)value;
         return 1;
     }
     if (marker == 0x22 && view.table_ofs - pos >= 4) {

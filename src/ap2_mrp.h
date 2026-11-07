@@ -35,6 +35,10 @@ void ap2_mrp_set_remote_command_callback(
 void ap2_mrp_set_remote_volume_callback(
     struct ap2_mrp_ctx *m, ap2_remote_volume_cb_t callback, void *userdata);
 
+/* Receive absolute seek requests in seconds. Set before attaching events. */
+void ap2_mrp_set_remote_seek_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_seek_cb_t callback, void *userdata);
+
 typedef enum {
     AP2_MRP_PLAYBACK_PLAYING = 1,
     AP2_MRP_PLAYBACK_PAUSED = 2,

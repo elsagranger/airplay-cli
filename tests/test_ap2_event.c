@@ -617,7 +617,13 @@ static void test_modern_transport_events(const uint8_t secret[KEY_SIZE])
         {"0 ", NULL, 0, -1},
         {"", NULL, 0, -1},
         {"play", NULL, 0, -1},
-        {"0", NULL, 1, -1},
+        {"0", NULL, 1, AP2_REMOTE_COMMAND_PLAY},
+        {"1", NULL, 1, AP2_REMOTE_COMMAND_PAUSE},
+        {"2", NULL, 1, AP2_REMOTE_COMMAND_PLAY_PAUSE},
+        {"4", NULL, 1, AP2_REMOTE_COMMAND_NEXT},
+        {"5", NULL, 1, AP2_REMOTE_COMMAND_PREVIOUS},
+        {"-1", NULL, 1, -1},
+        {"24", NULL, 0, -1},
         {"0", NULL, 2, -1},
         {"0", NULL, 3, -1},
         {"0", NULL, 4, -1},
@@ -648,7 +654,7 @@ static void test_modern_transport_events(const uint8_t secret[KEY_SIZE])
                 target = ap2_pl_dict();
                 ap2_pl_dict_set(root, "params", target);
             }
-            ap2_pl_node *value = cases[i].shape == 1 ? ap2_pl_int(0) :
+            ap2_pl_node *value = cases[i].shape == 1 ? ap2_pl_int(atoi(cases[i].modern)) :
                 cases[i].shape == 2 ? ap2_pl_bool(false) : ap2_pl_string(cases[i].modern);
             ap2_pl_dict_set(target, "modernMediaRemoteCommand", value);
         }

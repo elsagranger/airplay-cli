@@ -330,9 +330,15 @@ already-applied normalized level: multiply by 100 for percentage, or by 30 and
 subtract 30 for AirPlay dB. Do not echo that feedback back to the receiver.
 Both command formats are supported: legacy root `value` strings
 `play`/`paus`/`plps`/`nitm`/`pitm`, and root `modernMediaRemoteCommand`
-strings `0`/`1`/`2`/`4`/`5`, respectively. If both fields contain strings,
-`value` takes precedence. Unknown codes, non-string modern values and nested
-command fields are acknowledged without triggering a transport action.
+strings or numbers `0`/`1`/`2`/`4`/`5`, respectively. A readable legacy `value`
+string takes precedence. Unknown codes, booleans and nested command fields are
+acknowledged without triggering a transport action.
+
+The `/command` capability list also enables absolute scrubbing (command `24`).
+Its finite, nonnegative `kMRMediaRemoteOptionPlaybackPosition` number, at root
+or directly in `params`, is emitted as `[EVENT] seek position=<seconds>` after
+the encrypted ACK. The controller must seek the owning media queue and publish
+the resulting progress; changing metadata alone does not move the audio.
 
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new

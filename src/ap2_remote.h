@@ -24,6 +24,9 @@ typedef void (*ap2_remote_command_cb_t)(ap2_remote_command_t command,
 /* Device-reported absolute volume, normalized to [0, 1]. */
 typedef void (*ap2_remote_volume_cb_t)(double volume, void *userdata);
 
+/* Absolute position in seconds within the current media item. */
+typedef void (*ap2_remote_seek_cb_t)(double position, void *userdata);
+
 static inline const char *ap2_remote_command_name(ap2_remote_command_t command)
 {
     switch (command) {

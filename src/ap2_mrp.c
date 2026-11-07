@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/time.h>
@@ -161,6 +162,8 @@ struct ap2_mrp_ctx {
     void *remote_command_userdata;
     ap2_remote_volume_cb_t remote_volume_cb;
     void *remote_volume_userdata;
+    ap2_remote_seek_cb_t remote_seek_cb;
+    void *remote_seek_userdata;
 
     /* Channel crypto. The event and DataStream keys derive from the pairing
      * secret of the RTSP session they belong to: 32 bytes after pair-verify,
@@ -1138,6 +1141,14 @@ void ap2_mrp_set_remote_volume_callback(
     m->remote_volume_userdata = userdata;
 }
 
+void ap2_mrp_set_remote_seek_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_seek_cb_t callback, void *userdata)
+{
+    if (!m) return;
+    m->remote_seek_cb = callback;
+    m->remote_seek_userdata = userdata;
+}
+
 static void mrp_emit_remote_command(
     struct ap2_mrp_ctx *m, ap2_remote_command_t command)
 {
@@ -1147,14 +1158,15 @@ static void mrp_emit_remote_command(
 
 static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
                                      ap2_remote_command_t *command,
-                                     double *volume, bool *have_volume)
+                                     double *volume, bool *have_volume,
+                                     double *position, bool *have_seek)
 {
     if (!body || body_len < 8 || !command ||
         memcmp(body, "bplist00", 8) != 0)
         return false;
 
     char type[64];
-    char value[64];
+    char value[64] = "";
     if (!ap2_bplist_get_root_string(
             body, (size_t)body_len, "type", type, sizeof(type)) ||
         strcmp(type, "sendMediaRemoteCommand") != 0)
@@ -1163,8 +1175,11 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
     /* Preserve legacy semantics when both command representations are sent. */
     bool modern = !ap2_bplist_get_root_string(
         body, (size_t)body_len, "value", value, sizeof(value));
+    double modern_number = -1;
     if (modern && !ap2_bplist_get_root_string(
-            body, (size_t)body_len, "modernMediaRemoteCommand", value, sizeof(value)))
+            body, (size_t)body_len, "modernMediaRemoteCommand", value, sizeof(value)) &&
+        !ap2_bplist_get_root_number(
+            body, (size_t)body_len, "modernMediaRemoteCommand", NULL, &modern_number))
         return false;
 
     if (!modern && strcmp(value, "dvlc") == 0) {
@@ -1174,15 +1189,22 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
         return false;
     }
 
-    if (strcmp(value, modern ? "0" : "play") == 0)
+    if (modern && (strcmp(value, "24") == 0 || modern_number == 24)) {
+        *have_seek = ap2_bplist_get_root_number(
+            body, (size_t)body_len, "kMRMediaRemoteOptionPlaybackPosition", "params", position) &&
+            isfinite(*position) && *position >= 0.0;
+        return false;
+    }
+
+    if (strcmp(value, modern ? "0" : "play") == 0 || modern_number == 0)
         *command = AP2_REMOTE_COMMAND_PLAY;
-    else if (strcmp(value, modern ? "1" : "paus") == 0)
+    else if (strcmp(value, modern ? "1" : "paus") == 0 || modern_number == 1)
         *command = AP2_REMOTE_COMMAND_PAUSE;
-    else if (strcmp(value, modern ? "2" : "plps") == 0)
+    else if (strcmp(value, modern ? "2" : "plps") == 0 || modern_number == 2)
         *command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
-    else if (strcmp(value, modern ? "4" : "nitm") == 0)
+    else if (strcmp(value, modern ? "4" : "nitm") == 0 || modern_number == 4)
         *command = AP2_REMOTE_COMMAND_NEXT;
-    else if (strcmp(value, modern ? "5" : "pitm") == 0)
+    else if (strcmp(value, modern ? "5" : "pitm") == 0 || modern_number == 5)
         *command = AP2_REMOTE_COMMAND_PREVIOUS;
     else
         return false;
@@ -1212,8 +1234,14 @@ static void mrp_log_event_command_body(const char *header,
                 body, (size_t)body_len, command_key, value, sizeof(value))) {
             command_key = "modernMediaRemoteCommand";
             if (!ap2_bplist_get_root_string(
-                    body, (size_t)body_len, command_key, value, sizeof(value)))
-                value[0] = '\0';
+                    body, (size_t)body_len, command_key, value, sizeof(value))) {
+                double number;
+                if (ap2_bplist_get_root_number(
+                        body, (size_t)body_len, command_key, NULL, &number))
+                    snprintf(value, sizeof(value), "%.17g", number);
+                else
+                    value[0] = '\0';
+            }
         }
         mrp_event_log_text(safe_value, value);
         if (safe_type[0] && safe_value[0]) {
@@ -1305,11 +1333,14 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
         bool have_remote_command = false;
         double remote_volume = 0.0;
         bool have_remote_volume = false;
+        double remote_position = 0.0;
+        bool have_remote_seek = false;
         if (is_command) {
             const uint8_t *body = m->event_plain + off + header_len;
             have_remote_command =
                 mrp_parse_remote_command(body, content_len, &remote_command,
-                                         &remote_volume, &have_remote_volume);
+                                         &remote_volume, &have_remote_volume,
+                                         &remote_position, &have_remote_seek);
             if (*loglevel >= lDEBUG)
                 mrp_log_event_command_body(header, body, content_len);
         }
@@ -1342,6 +1373,8 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             mrp_emit_remote_command(m, remote_command);
         if (have_remote_volume && m->remote_volume_cb)
             m->remote_volume_cb(remote_volume, m->remote_volume_userdata);
+        if (have_remote_seek && m->remote_seek_cb)
+            m->remote_seek_cb(remote_position, m->remote_seek_userdata);
         if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;
@@ -2064,6 +2097,14 @@ static ap2_pl_node *mrp_cmd_info_blob(int cmd)
     ap2_pl_node *d = ap2_pl_dict();
     ap2_pl_dict_set(d, "kCommandInfoCommandKey", ap2_pl_int(cmd));
     ap2_pl_dict_set(d, "kCommandInfoEnabledKey", ap2_pl_bool(true));
+    if (cmd == 24) {
+        ap2_pl_node *options = ap2_pl_dict();
+        ap2_pl_dict_set(options, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
+                        ap2_pl_bool(true));
+        ap2_pl_dict_set(options, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
+                        ap2_pl_bool(false));
+        ap2_pl_dict_set(d, "kCommandInfoOptionsKey", options);
+    }
     uint8_t *b = NULL;
     int bl = ap2_pl_serialize(d, &b);
     ap2_pl_free(d);
@@ -2077,12 +2118,11 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
 {
     (void)m;
     if (!out || !out_len) return false;
-    /* MRMediaRemoteCommand numbering (Play=0, Pause=1, ...), distinct from
-     * the protobuf enum used by type-130 SET_STATE. Advertise only the five
-     * transport controls handled by the reverse event parser. */
+    /* MRMediaRemoteCommand numbering (Play=0, Pause=1, Seek=24), distinct
+     * from the protobuf enum used by type-130 SET_STATE. */
     ap2_pl_node *arr = ap2_pl_array();
 
-    static const int simple[] = { 5, 4, 2, 1, 0 };
+    static const int simple[] = { 24, 5, 4, 2, 1, 0 };
     for (size_t i = 0; i < sizeof(simple) / sizeof(simple[0]); i++)
         ap2_pl_array_append(arr, mrp_cmd_info_blob(simple[i]));
 

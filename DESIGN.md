@@ -672,9 +672,10 @@ connect the sender emits the initial sequence from AirPlaySender's
 5. **`updateMRNowPlayingClient`** — the serialized `NowPlayingClient` external
    representation the receiver expects.
 
-Only play, pause, toggle, next and previous are advertised as supported controls
-(MR command values 0, 1, 2, 4, 5). A full now-playing HTTP refusal disables
-further MRP publication for this session without disabling audio or event ACKs;
+The `/command` path advertises play, pause, toggle, next, previous and absolute
+seek (MR command values 0, 1, 2, 4, 5, 24). Seek enables scrubbing, not relative
+reference positions. A full now-playing HTTP refusal disables further MRP
+publication for this session without disabling audio or event ACKs;
 transport errors still fail the control channel. Refusal of the lean timeline
 merge policy is separate and retains the full-replace fallback below.
 
@@ -756,17 +757,24 @@ for the rest of the session (`ap2cl_mrp_push_progress`).
 
 **Receiver controls.** `sendMediaRemoteCommand` events accept legacy root
 `value` strings `play`/`paus`/`plps`/`nitm`/`pitm`, or modern root
-`modernMediaRemoteCommand` strings `0`/`1`/`2`/`4`/`5`. Both map to explicit
-play/pause, toggle, next/previous, respectively. A readable legacy string takes
-precedence over the modern field, including when the legacy value is unknown.
-Unknown codes, non-string modern values and nested fields do not dispatch a
-transport action. The CLI emits normalized commands on stdout; queue selection
+`modernMediaRemoteCommand` strings or numbers `0`/`1`/`2`/`4`/`5`. Both map to
+explicit play/pause, toggle, next/previous, respectively. A readable legacy
+string takes precedence, including when that legacy value is unknown. Unknown
+codes, booleans and nested fields do not dispatch a transport action. The CLI
+emits normalized commands on stdout; queue selection
 and coordinated playback remain in the caller. Unknown events are still
 acknowledged. `dvlc` carries device volume
 at root `volume` or direct `params.volume`: only finite integers/reals in 0..1
 are accepted, never booleans or nested lookalikes. The encrypted ACK precedes
 the callback. `[EVENT] volume value=<0..1>` is already applied on the device,
 so callers update their per-device state without sending a volume echo.
+
+Modern command `24` carries an absolute seek position in seconds via numeric
+`kMRMediaRemoteOptionPlaybackPosition`, at root or in direct `params`. Finite,
+nonnegative targets produce `[EVENT] seek position=<seconds>` after the ACK;
+the caller, not the CLI metadata state, owns rebuilding playback at that target.
+Music Assistant routes the event through its existing player seek controller,
+which resolves sync/group/protocol ownership and validates the active queue.
 
 Identity churn is equally destructive and equally guarded: `set_track` mints
 a fresh `UniqueIdentifier` only when the item identity (item id, else the
@@ -1186,6 +1194,7 @@ verbosity, never its stream.
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
 | `[EVENT] remote command=` | stdout | device-originated remote-control press |
 | `[EVENT] volume value=` | stdout | validated receiver volume, normalized 0..1 |
+| `[EVENT] seek position=` | stdout | absolute receiver-requested position, seconds |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |
